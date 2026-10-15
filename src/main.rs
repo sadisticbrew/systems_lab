@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use systemslab::{cli, exit, record};
+use systemslab::{cli, exit, record, server};
 
 #[derive(Parser)]
 #[command(name = "systemslab", version, about = "Record real x86-64 executions and inspect them")]
@@ -82,6 +82,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Open a trace in the browser viewer
+    View {
+        /// A .slt trace, or a lab directory whose out/ holds one
+        path: PathBuf,
+        /// Port to listen on (default: any free port)
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Do not launch a browser
+        #[arg(long)]
+        no_open: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -108,6 +119,7 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         Command::Stack { trace, loc, frames, json } => cli::stack(&trace, &loc, frames, json),
         Command::Dot { figure: DotFigure::Stack { trace, loc, frames } } => cli::dot_stack(&trace, &loc, frames),
         Command::CheckAbi { trace, all, json } => cli::check_abi(&trace, all, json),
+        Command::View { path, port, no_open } => server::view(&path, port, no_open),
     }
 }
 

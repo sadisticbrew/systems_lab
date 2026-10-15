@@ -54,7 +54,7 @@
 <style>
   .pad { padding: 8px; }
   .ln { display: flex; gap: 12px; white-space: pre; padding: 0 6px; }
-  .loc { min-width: 12ch; }
-  .bytes { min-width: 16ch; overflow: hidden; }
+  .loc { min-width: 12ch; flex: none; }
+  .bytes { min-width: 16ch; flex: none; }
   .cur, .cur:hover { background: var(--hl); }
 </style>
