@@ -1,0 +1,171 @@
+//! Instruction decoding and planning of the memory each instruction writes.
+
+use std::collections::HashMap;
+
+use iced_x86::{Decoder, DecoderOptions, InstructionInfoFactory, Mnemonic, OpAccess, Register, UsedMemory};
+
+use crate::trace::{Insn, RegFile, reg};
+
+use super::spawn::Tracee;
+
+/// What the recorder needs to know about one instruction, computed once per address.
+#[derive(Default)]
+pub struct Plan {
+    pub syscall: bool,
+    /// Writes to ES:RDI (movs/stos/ins); its range comes from the rdi delta.
+    pub string_elem: Option<u64>,
+    /// push/pushf/call/enter: the stack bytes below the old rsp are written.
+    pub rsp_union: bool,
+    /// Memory operands with a write access and a known size.
+    pub mems: Vec<(UsedMemory, u64, bool)>,
+    /// A write access of unknown size (xsave and friends): needs a full diff.
+    pub unsized_write: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct Range {
+    pub start: u64,
+    pub end: u64,
+    /// Written only if the bytes change (CondWrite).
+    pub cond: bool,
+}
+
+pub struct Insns {
+    pub list: Vec<Insn>,
+    pub plans: Vec<Plan>,
+    map: HashMap<u64, u32>,
+    factory: InstructionInfoFactory,
+}
+
+impl Insns {
+    pub fn new() -> Self {
+        Insns { list: Vec::new(), plans: Vec::new(), map: HashMap::new(), factory: InstructionInfoFactory::new() }
+    }
+
+    /// Index of the instruction at `rip`, fetching and decoding it on first use.
+    pub fn index(&mut self, t: &Tracee, rip: u64) -> u32 {
+        if let Some(&i) = self.map.get(&rip) {
+            return i;
+        }
+        let mut buf = [0u8; 15];
+        let n = t.read(rip, &mut buf);
+        let mut plan = Plan::default();
+        let mut len = n;
+        if n > 0 {
+            let mut dec = Decoder::with_ip(64, &buf[..n], rip, DecoderOptions::NONE);
+            let ins = dec.decode();
+            if !ins.is_invalid() {
+                len = ins.len();
+                plan.syscall = ins.mnemonic() == Mnemonic::Syscall;
+                plan.rsp_union = matches!(
+                    ins.mnemonic(),
+                    Mnemonic::Push | Mnemonic::Pushfq | Mnemonic::Pushfd | Mnemonic::Pushf | Mnemonic::Call | Mnemonic::Enter
+                );
+                let string = ins.is_string_instruction();
+                for m in self.factory.info(&ins).used_memory() {
+                    let (write, cond) = match m.access() {
+                        OpAccess::Write | OpAccess::ReadWrite => (true, false),
+                        OpAccess::CondWrite | OpAccess::ReadCondWrite => (true, true),
+                        _ => (false, false),
+                    };
+                    if !write {
+                        continue;
+                    }
+                    let size = m.memory_size().size() as u64;
+                    if size == 0 {
+                        plan.unsized_write = true;
+                    } else if string {
+                        plan.string_elem = Some(size);
+                    } else {
+                        plan.mems.push((*m, size, cond));
+                    }
+                }
+            }
+        }
+        let idx = self.list.len() as u32;
+        self.list.push(Insn { addr: rip, bytes: buf[..len].to_vec() });
+        self.plans.push(plan);
+        self.map.insert(rip, idx);
+        idx
+    }
+}
+
+fn reg_value(r: &RegFile, reg: Register) -> Option<u64> {
+    let idx = match reg.full_register() {
+        Register::RAX => reg::RAX,
+        Register::RBX => reg::RBX,
+        Register::RCX => reg::RCX,
+        Register::RDX => reg::RDX,
+        Register::RSI => reg::RSI,
+        Register::RDI => reg::RDI,
+        Register::RBP => reg::RBP,
+        Register::RSP => reg::RSP,
+        Register::R8 => 8,
+        Register::R9 => 9,
+        Register::R10 => 10,
+        Register::R11 => 11,
+        Register::R12 => reg::R12,
+        Register::R13 => reg::R13,
+        Register::R14 => reg::R14,
+        Register::R15 => reg::R15,
+        Register::RIP => return Some(r.rip),
+        Register::FS => return Some(r.fs_base),
+        Register::GS => return Some(r.gs_base),
+        Register::CS | Register::DS | Register::ES | Register::SS => return Some(0),
+        _ => return None,
+    };
+    let v = r.gpr[idx as usize];
+    Some(if reg.is_gpr64() {
+        v
+    } else if reg.is_gpr32() {
+        v as u32 as u64
+    } else if reg.is_gpr16() {
+        v as u16 as u64
+    } else if matches!(reg, Register::AH | Register::CH | Register::DH | Register::BH) {
+        (v >> 8) & 0xff
+    } else {
+        v & 0xff
+    })
+}
+
+/// Fills `out` with the ranges the instruction will write, with addresses
+/// computed from `cur` (the state before the step).
+pub fn plan_ranges(plan: &Plan, cur: &RegFile, out: &mut Vec<Range>) {
+    out.clear();
+    for (m, size, cond) in &plan.mems {
+        if let Some(a) = m.virtual_address(0, |r, _, _| reg_value(cur, r)) {
+            out.push(Range { start: a, end: a.wrapping_add(*size), cond: *cond });
+        }
+    }
+}
+
+/// Adds the ranges that depend on the registers after the step, then sorts
+/// and merges overlapping ranges.
+pub fn finish_ranges(plan: &Plan, cur: &RegFile, new: &RegFile, out: &mut Vec<Range>) {
+    if let Some(elem) = plan.string_elem {
+        let before = cur.gpr[reg::RDI as usize];
+        let after = new.gpr[reg::RDI as usize];
+        if after > before {
+            out.push(Range { start: before, end: after, cond: false });
+        } else if after < before {
+            out.push(Range { start: after + elem, end: before + elem, cond: false });
+        }
+    }
+    if plan.rsp_union && new.rsp() < cur.rsp() {
+        out.push(Range { start: new.rsp(), end: cur.rsp(), cond: false });
+    }
+    if out.len() > 1 {
+        out.sort_unstable_by_key(|r| r.start);
+        let mut w = 0;
+        for k in 1..out.len() {
+            if out[k].start <= out[w].end {
+                out[w].end = out[w].end.max(out[k].end);
+                out[w].cond &= out[k].cond;
+            } else {
+                w += 1;
+                out[w] = out[k];
+            }
+        }
+        out.truncate(w + 1);
+    }
+}
