@@ -1,0 +1,11 @@
+# Subagent routing for building SystemsLab: cheaper models than the Opus session.
+modelRoles:
+  sl_worker: anthropic/claude-sonnet-5-5:medium
+  sl_fast: anthropic/claude-haiku-5-5:low
+  sl_review: openai-codex/gpt-6.1-sol:medium
+task:
+  agentModelOverrides:
+    task: "@sl_worker"
+    sonic: "@sl_fast"
+    scout: "@sl_fast"
+    reviewer: "@sl_review"
