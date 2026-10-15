@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use systemslab::{exit, record};
+use systemslab::{cli, exit, record};
 
 #[derive(Parser)]
 #[command(name = "systemslab", version, about = "Record real x86-64 executions and inspect them")]
@@ -35,6 +35,64 @@ enum Command {
         #[arg(last = true, required = true, num_args = 1..)]
         command: Vec<String>,
     },
+    /// Summarize a trace
+    Info {
+        trace: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List steps with their register changes, memory writes and events
+    Steps {
+        trace: PathBuf,
+        /// First step: `step:N`, `SYMBOL[+OFFSET][@K]` or `0xADDR[@K]` (default: step 0)
+        #[arg(long)]
+        from: Option<String>,
+        /// Step to stop before (exclusive; default: the end)
+        #[arg(long)]
+        to: Option<String>,
+        /// Only steps whose instruction is in this function
+        #[arg(long)]
+        func: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the stack frames and slots at a step
+    Stack {
+        trace: PathBuf,
+        loc: String,
+        /// Show only the innermost N activations; the rest collapse into one row
+        #[arg(long)]
+        frames: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Generate Graphviz figures
+    Dot {
+        #[command(subcommand)]
+        figure: DotFigure,
+    },
+    /// Check System V ABI rules over the recorded calls
+    CheckAbi {
+        trace: PathBuf,
+        /// Check every call and activation, not only those of the main executable
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DotFigure {
+    /// The stack at a step as a Graphviz figure
+    Stack {
+        trace: PathBuf,
+        loc: String,
+        #[arg(long)]
+        frames: Option<usize>,
+    },
 }
 
 fn run(cli: Cli) -> anyhow::Result<u8> {
@@ -43,6 +101,13 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
             let program = command.remove(0);
             record::run(&record::Options { from, max_steps, strict, quiet, output, program, args: command })
         }
+        Command::Info { trace, json } => cli::info(&trace, json),
+        Command::Steps { trace, from, to, func, limit, json } => {
+            cli::steps(&cli::StepsOptions { trace, from, to, func, limit, json })
+        }
+        Command::Stack { trace, loc, frames, json } => cli::stack(&trace, &loc, frames, json),
+        Command::Dot { figure: DotFigure::Stack { trace, loc, frames } } => cli::dot_stack(&trace, &loc, frames),
+        Command::CheckAbi { trace, all, json } => cli::check_abi(&trace, all, json),
     }
 }
 
