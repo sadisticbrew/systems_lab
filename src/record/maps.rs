@@ -5,13 +5,19 @@ use anyhow::{Context, Result};
 use crate::trace::Region;
 
 pub fn parse_maps(pid: libc::pid_t) -> Result<Vec<Region>> {
+    Ok(parse_maps_ident(pid)?.0)
+}
+
+/// Regions plus, per region, its `dev:inode` string (the backing file's identity).
+pub fn parse_maps_ident(pid: libc::pid_t) -> Result<(Vec<Region>, Vec<String>)> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/maps")).context("reading /proc/<pid>/maps")?;
     let mut out = Vec::new();
+    let mut ids = Vec::new();
     for line in text.lines() {
         let mut it = line.splitn(6, ' ');
         let (Some(range), Some(perms), Some(offset)) = (it.next(), it.next(), it.next()) else { continue };
-        let _dev = it.next();
-        let _inode = it.next();
+        let dev = it.next().unwrap_or("");
+        let inode = it.next().unwrap_or("");
         let path = it.next().unwrap_or("").trim_start().to_string();
         let Some((s, e)) = range.split_once('-') else { continue };
         let (Ok(start), Ok(end), Ok(offset)) =
@@ -20,8 +26,9 @@ pub fn parse_maps(pid: libc::pid_t) -> Result<Vec<Region>> {
             continue;
         };
         out.push(Region { start, end, perms: perms.to_string(), offset, path });
+        ids.push(format!("{dev}:{inode}"));
     }
-    Ok(out)
+    Ok((out, ids))
 }
 
 /// Regions the kernel exposes but that must not be snapshotted.
@@ -69,6 +76,30 @@ pub fn subtract(new: &[(u64, u64)], old: &[(u64, u64)]) -> Vec<(u64, u64)> {
             out.push((s, e));
         }
     }
+    out
+}
+
+/// Readable ranges of `new` whose contents may differ from what `old` already
+/// held: parts not covered by an old region with the same identity (perms, path,
+/// backing file, and for files the same file offset at the same address).
+pub fn changed_readable(new: &[Region], new_ids: &[String], old: &[Region], old_ids: &[String]) -> Vec<(u64, u64)> {
+    let key = |r: &Region, id: &str| {
+        let delta = if r.path.starts_with('/') { r.offset.wrapping_sub(r.start) } else { 0 };
+        (r.perms.clone(), r.path.clone(), id.to_string(), delta)
+    };
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (r, id) in new.iter().zip(new_ids).filter(|(r, _)| is_readable(r)) {
+        let k = key(r, id);
+        let mut same: Vec<(u64, u64)> = old
+            .iter()
+            .zip(old_ids)
+            .filter(|(o, oid)| is_readable(o) && key(o, oid) == k)
+            .map(|(o, _)| (o.start, o.end))
+            .collect();
+        same.sort_unstable();
+        out.extend(subtract(&[(r.start, r.end)], &same));
+    }
+    out.sort_unstable();
     out
 }
 

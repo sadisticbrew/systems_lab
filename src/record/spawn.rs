@@ -227,6 +227,17 @@ impl Tracee {
     }
 }
 
+/// Bitmask (bit `signo - 1`) of the signals `pid` has handlers for.
+pub fn caught_signals(pid: libc::pid_t) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| {
+            let line = s.lines().find_map(|l| l.strip_prefix("SigCgt:"))?;
+            u64::from_str_radix(line.trim(), 16).ok()
+        })
+        .unwrap_or(0)
+}
+
 impl Drop for Tracee {
     fn drop(&mut self) {
         self.kill();
