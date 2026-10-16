@@ -17,18 +17,35 @@ pub enum NavOp {
     RegPrev(u8),
     RegNext(u8),
     WritePrev(u64),
+    /// The next step that writes the byte at this address.
+    WriteNext(u64),
     AtNext(u64),
+    /// The next step that enters this source line (`file` as in a `FILE:LINE` locator), at any call depth.
+    LineNext { file: String, line: u32 },
+}
+
+/// The request parameters that select a navigation target, as the API receives them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NavParams<'a> {
+    /// A register name (`rax`) for `reg-prev` / `reg-next`.
+    pub reg: Option<&'a str>,
+    /// A hex address, optional `0x`, for `write-prev`, `write-next` and `at-next`.
+    pub addr: Option<&'a str>,
+    /// A source file as in a `FILE:LINE` locator, for `line-next`.
+    pub file: Option<&'a str>,
+    /// A line number, for `line-next`.
+    pub line: Option<&'a str>,
 }
 
 impl NavOp {
-    /// Builds an op from the API's `op`, `reg` and `addr` (hex, optional `0x`) parameters.
-    pub fn parse(op: &str, reg_name: Option<&str>, addr: Option<&str>) -> Result<NavOp> {
+    /// Builds an op from the API's `op` and its parameters.
+    pub fn parse(op: &str, p: &NavParams) -> Result<NavOp> {
         let reg_id = || -> Result<u8> {
-            let name = reg_name.ok_or_else(|| exit::usage(format!("op {op} needs reg=")))?;
+            let name = p.reg.ok_or_else(|| exit::usage(format!("op {op} needs reg=")))?;
             reg::by_name(name).ok_or_else(|| exit::usage(format!("unknown register '{name}'")))
         };
         let addr_val = || -> Result<u64> {
-            let a = addr.ok_or_else(|| exit::usage(format!("op {op} needs addr=")))?;
+            let a = p.addr.ok_or_else(|| exit::usage(format!("op {op} needs addr=")))?;
             u64::from_str_radix(a.strip_prefix("0x").unwrap_or(a), 16).map_err(|_| exit::usage(format!("bad address '{a}'")))
         };
         Ok(match op {
@@ -41,7 +58,14 @@ impl NavOp {
             "reg-prev" => NavOp::RegPrev(reg_id()?),
             "reg-next" => NavOp::RegNext(reg_id()?),
             "write-prev" => NavOp::WritePrev(addr_val()?),
+            "write-next" => NavOp::WriteNext(addr_val()?),
             "at-next" => NavOp::AtNext(addr_val()?),
+            "line-next" => {
+                let file = p.file.ok_or_else(|| exit::usage(format!("op {op} needs file=")))?;
+                let line = p.line.ok_or_else(|| exit::usage(format!("op {op} needs line=")))?;
+                let line = line.parse().map_err(|_| exit::usage(format!("bad line '{line}'")))?;
+                NavOp::LineNext { file: file.to_string(), line }
+            }
             _ => bail!(exit::usage(format!("unknown nav op '{op}'"))),
         })
     }
@@ -96,15 +120,19 @@ impl LoadedTrace {
             }
             NavOp::RegNext(id) => {
                 let ds = &self.trace.reg_deltas;
-                let lo = ds.partition_point(|x| x.seq <= from);
+                let lo = ds.partition_point(|x| x.seq <= from + 1);
                 ds[lo..].iter().find(|x| x.reg == *id).map(|x| x.seq - 1)
             }
             NavOp::WritePrev(addr) => self.write_prev(from, *addr),
+            NavOp::WriteNext(addr) => self.write_next(from, *addr),
             NavOp::AtNext(addr) => {
-                let hit = self.insn_by_addr.get(addr).and_then(|&idx| {
-                    (from as usize + 1..self.trace.steps.len()).find(|&i| self.trace.steps[i].insn == idx).map(|i| i as u32)
-                });
+                let steps = self.insn_by_addr.get(addr).map_or(&[][..], |&idx| &self.occ[idx as usize]);
+                let hit = steps.get(steps.partition_point(|&s| s <= from)).copied();
                 hit.or_else(|| (from < n && self.regs_at(n).rip == *addr).then_some(n))
+            }
+            NavOp::LineNext { file, line } => {
+                let files = self.source_files(file)?;
+                (from + 1..n).find(|&t| self.enters_line(t, &files, *line))
             }
         })
     }
@@ -124,6 +152,17 @@ impl LoadedTrace {
             .rev()
             .map(|&wi| &self.trace.writes[wi as usize])
             .find(|w| w.kind != crate::trace::WriteKind::Snapshot && w.seq >= 1 && w.addr <= addr && addr < w.addr + w.data.len() as u64)
+            .map(|w| w.seq - 1)
+    }
+
+    /// The smallest step `i > from` whose writes cover `addr`.
+    fn write_next(&self, from: u32, addr: u64) -> Option<u32> {
+        let list = self.page_index.get(&(addr & !(crate::trace::PAGE_SIZE - 1)))?;
+        let lo = list.partition_point(|&wi| self.trace.writes[wi as usize].seq <= from + 1);
+        list[lo..]
+            .iter()
+            .map(|&wi| &self.trace.writes[wi as usize])
+            .find(|w| w.kind != crate::trace::WriteKind::Snapshot && w.addr <= addr && addr < w.addr + w.data.len() as u64)
             .map(|w| w.seq - 1)
     }
 }

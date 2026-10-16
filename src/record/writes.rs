@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 
-use iced_x86::{Decoder, DecoderOptions, InstructionInfoFactory, Mnemonic, OpAccess, Register, UsedMemory};
+use iced_x86::{Decoder, DecoderOptions, InstructionInfoFactory, Mnemonic, OpAccess, UsedMemory};
 
 use crate::trace::{Insn, RegFile, reg};
+use crate::x86::reg_value;
 
 use super::spawn::Tracee;
 
@@ -97,44 +98,6 @@ impl Insns {
         self.map.insert(rip, idx);
         idx
     }
-}
-
-fn reg_value(r: &RegFile, reg: Register) -> Option<u64> {
-    let idx = match reg.full_register() {
-        Register::RAX => reg::RAX,
-        Register::RBX => reg::RBX,
-        Register::RCX => reg::RCX,
-        Register::RDX => reg::RDX,
-        Register::RSI => reg::RSI,
-        Register::RDI => reg::RDI,
-        Register::RBP => reg::RBP,
-        Register::RSP => reg::RSP,
-        Register::R8 => 8,
-        Register::R9 => 9,
-        Register::R10 => 10,
-        Register::R11 => 11,
-        Register::R12 => reg::R12,
-        Register::R13 => reg::R13,
-        Register::R14 => reg::R14,
-        Register::R15 => reg::R15,
-        Register::RIP => return Some(r.rip),
-        Register::FS => return Some(r.fs_base),
-        Register::GS => return Some(r.gs_base),
-        Register::CS | Register::DS | Register::ES | Register::SS => return Some(0),
-        _ => return None,
-    };
-    let v = r.gpr[idx as usize];
-    Some(if reg.is_gpr64() {
-        v
-    } else if reg.is_gpr32() {
-        v as u32 as u64
-    } else if reg.is_gpr16() {
-        v as u16 as u64
-    } else if matches!(reg, Register::AH | Register::CH | Register::DH | Register::BH) {
-        (v >> 8) & 0xff
-    } else {
-        v & 0xff
-    })
 }
 
 /// Fills `out` with the ranges the instruction will write, with addresses

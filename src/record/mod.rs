@@ -8,7 +8,7 @@ mod spawn;
 mod writes;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -51,25 +51,35 @@ pub struct Recording {
     pub unattributed: Vec<(u64, u32)>,
 }
 
+/// How a recording ended, as shown in the summary: `exit N`, `signal NAME` or `max-steps`.
+pub fn end_text(end: &End) -> String {
+    match *end {
+        End::Exit { code } => format!("exit {code}"),
+        End::Signal { signo } => format!("signal {}", signals::name(signo)),
+        End::MaxSteps => "max-steps".to_string(),
+    }
+}
+
+/// Prints the one-line recording summary to stderr.
+pub fn print_summary(trace: &Trace, output: &Path) {
+    let meta = &trace.meta;
+    eprintln!(
+        "recorded {} steps from {}; ended: {}; unattributed bytes: {}; wrote {}",
+        trace.steps.len(),
+        meta.from,
+        end_text(&meta.end),
+        meta.unattributed_bytes,
+        output.display()
+    );
+}
+
 /// `record` command: records, writes the trace file, prints the summary, applies `--strict`.
 pub fn run(opts: &Options) -> Result<u8> {
     let rec = record(opts)?;
     trace::save(&opts.output, &rec.trace).map_err(|e| exit::usage(format!("{e:#}")))?;
     let meta = &rec.trace.meta;
     if !opts.quiet {
-        let ended = match meta.end {
-            End::Exit { code } => format!("exit {code}"),
-            End::Signal { signo } => format!("signal {}", signals::name(signo)),
-            End::MaxSteps => "max-steps".to_string(),
-        };
-        eprintln!(
-            "recorded {} steps from {}; ended: {}; unattributed bytes: {}; wrote {}",
-            rec.trace.steps.len(),
-            meta.from,
-            ended,
-            meta.unattributed_bytes,
-            opts.output.display()
-        );
+        print_summary(&rec.trace, &opts.output);
     }
     if opts.strict && meta.unattributed_bytes > 0 {
         for (addr, step) in &rec.unattributed {

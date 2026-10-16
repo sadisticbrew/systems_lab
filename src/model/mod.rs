@@ -5,14 +5,18 @@ mod abi;
 mod activations;
 mod api;
 mod asm;
+pub mod compare;
 mod dwarf;
+mod effects;
+mod events;
+mod expr;
 pub mod locator;
 mod nav;
 mod stack;
 mod symtab;
 mod views;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
@@ -23,7 +27,8 @@ use crate::trace::{self, CHECKPOINT_INTERVAL, Event, EventKind, MemWrite, MapsSn
 
 pub use abi::Finding;
 pub use activations::Activation;
-pub use nav::NavOp;
+pub use expr::WatchType;
+pub use nav::{NavOp, NavParams};
 pub use stack::{FrameView, RootFrame, SlotView, StackView};
 pub use views::*;
 
@@ -39,6 +44,16 @@ pub const FLAGS: [(&str, u32); 9] =
 
 pub fn flag_names(rflags: u64) -> Vec<String> {
     FLAGS.iter().filter(|&&(_, bit)| rflags >> bit & 1 == 1).map(|&(n, _)| n.to_string()).collect()
+}
+
+/// The name a write's kind has in the JSON views.
+fn write_kind_name(kind: WriteKind) -> &'static str {
+    match kind {
+        WriteKind::Snapshot => "snapshot",
+        WriteKind::Instr => "instr",
+        WriteKind::Kernel => "kernel",
+        WriteKind::Unattributed => "unattributed",
+    }
 }
 
 struct InsnText {
@@ -59,6 +74,10 @@ pub struct LoadedTrace {
     insn_line: Vec<Option<(u32, u32)>>,
     /// Instruction indices ordered by address.
     insns_sorted: Vec<u32>,
+    /// Steps (ascending) executing each instruction, indexed like `trace.insns`.
+    occ: Vec<Vec<u32>>,
+    /// Timeline markers, computed on first use.
+    markers: OnceLock<Vec<Marker>>,
     /// Display name per DWARF file index.
     file_display: Vec<String>,
     stack0: u64,
@@ -76,14 +95,26 @@ impl LoadedTrace {
         for (i, w) in trace.writes.iter().enumerate() {
             page_index.entry(w.addr & !(PAGE_SIZE - 1)).or_default().push(i as u32);
         }
-        let syms = Arc::new(SymTab::build(&trace)?);
+        let insn_info: Vec<InsnInfo> = trace.insns.iter().map(|x| asm::analyze(&x.bytes, x.addr)).collect();
+        // Where recorded near calls landed: those addresses start functions, even when the symbol table
+        // has them as untyped local labels.
+        let call_targets: HashSet<u64> = trace
+            .steps
+            .windows(2)
+            .filter(|w| w[0].kind == StepKind::Instr && insn_info[w[0].insn as usize].call)
+            .map(|w| trace.insns[w[1].insn as usize].addr)
+            .collect();
+        let syms = Arc::new(SymTab::build(&trace, &call_targets)?);
         let dwarf = DwarfInfo::build(&trace.exe.bytes, trace.exe.bias);
         let insn_by_addr = trace.insns.iter().enumerate().map(|(i, x)| (x.addr, i as u32)).collect();
-        let insn_info = trace.insns.iter().map(|x| asm::analyze(&x.bytes, x.addr)).collect();
         let insn_text = trace.insns.iter().map(|_| OnceLock::new()).collect();
         let insn_line = trace.insns.iter().map(|x| dwarf.line_at(x.addr)).collect();
         let mut insns_sorted: Vec<u32> = (0..trace.insns.len() as u32).collect();
         insns_sorted.sort_by_key(|&i| trace.insns[i as usize].addr);
+        let mut occ = vec![Vec::new(); trace.insns.len()];
+        for (i, s) in trace.steps.iter().enumerate() {
+            occ[s.insn as usize].push(i as u32);
+        }
         let file_display = dwarf
             .files
             .iter()
@@ -112,6 +143,8 @@ impl LoadedTrace {
             insn_text,
             insn_line,
             insns_sorted,
+            occ,
+            markers: OnceLock::new(),
             file_display,
             stack0: 0,
             acts: Activations::default(),
@@ -336,12 +369,24 @@ impl LoadedTrace {
 
     /// Resolves a locator to a step in `0..=N`.
     pub fn locate(&self, text: &str) -> Result<u32> {
+        let nth = |steps: &[u32], text: &str, k: u64| {
+            usize::try_from(k - 1)
+                .ok()
+                .and_then(|i| steps.get(i).copied())
+                .ok_or_else(|| exit::usage(format!("{text} occurs {} times; @{k} asked", steps.len())))
+        };
         match locator::parse(text)? {
             Locator::Step(n) => {
                 if n > u64::from(self.n) {
                     return Err(exit::usage(format!("step:{n} is outside 0..={}", self.n)));
                 }
                 Ok(n as u32)
+            }
+            Locator::End => Ok(self.n),
+            Locator::Line { file, line, text, k } => {
+                let files = self.source_files(&file)?;
+                let entries: Vec<u32> = (0..self.n).filter(|&s| self.enters_line(s, &files, line)).collect();
+                nth(&entries, &text, k)
             }
             Locator::Addr { spec, text, k } => {
                 let addr = match spec {
@@ -351,20 +396,56 @@ impl LoadedTrace {
                         a.wrapping_add(offset)
                     }
                 };
-                let mut count = 0u64;
-                if let Some(&idx) = self.insn_by_addr.get(&addr) {
-                    for (i, s) in self.trace.steps.iter().enumerate() {
-                        if s.insn == idx {
-                            count += 1;
-                            if count == k {
-                                return Ok(i as u32);
-                            }
-                        }
-                    }
-                }
-                Err(exit::usage(format!("{text} occurs {count} times; @{k} asked")))
+                nth(self.insn_by_addr.get(&addr).map_or(&[][..], |&idx| &self.occ[idx as usize]), &text, k)
             }
         }
+    }
+
+    /// A locator that `locate` resolves back to state `s`: `step:end` for the final state, else the
+    /// instruction's `loc` and occurrence number (`fact+0xc@3`), or its raw address (`0x…@3`) when the
+    /// symbolic form would not resolve to `s` (a stub or an ambiguous name).
+    pub fn locator_of(&self, s: u32) -> String {
+        if s >= self.n {
+            return "step:end".to_string();
+        }
+        let idx = self.trace.steps[s as usize].insn as usize;
+        let rip = self.trace.insns[idx].addr;
+        let k = self.occ[idx].partition_point(|&x| x < s) + 1;
+        let symbolic = format!("{}@{k}", self.loc(rip));
+        if self.locate(&symbolic).is_ok_and(|t| t == s) { symbolic } else { format!("0x{rip:x}@{k}") }
+    }
+
+    /// The DWARF file indices a locator's FILE names: the entries of `file_display` equal to it, else
+    /// those whose file name equals it, provided exactly one display path has that file name.
+    fn source_files(&self, file: &str) -> Result<Vec<u32>> {
+        let indices = |display: &str| -> Vec<u32> { (0..self.file_display.len() as u32).filter(|&i| self.file_display[i as usize] == display).collect() };
+        let exact = indices(file);
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+        let mut named: Vec<&str> = self
+            .file_display
+            .iter()
+            .map(String::as_str)
+            .filter(|d| Path::new(d).file_name().is_some_and(|n| n == file))
+            .collect();
+        named.sort_unstable();
+        named.dedup();
+        match named[..] {
+            [] => Err(exit::usage(format!("unknown source file '{file}'"))),
+            [only] => Ok(indices(only)),
+            _ => Err(exit::usage(format!("source file '{file}' is ambiguous: {}", named.join(", ")))),
+        }
+    }
+
+    /// Whether state `s` is on `line` of one of the DWARF `files`.
+    fn on_line(&self, s: u32, files: &[u32], line: u32) -> bool {
+        self.line_of_state(s).is_some_and(|(f, l)| l == line && files.contains(&f))
+    }
+
+    /// Whether state `s` enters `line` of `files`: it is on the line and the previous state was not.
+    fn enters_line(&self, s: u32, files: &[u32], line: u32) -> bool {
+        self.on_line(s, files, line) && (s == 0 || !self.on_line(s - 1, files, line))
     }
 
     /// Runtime address range `[start, end)` of the executable symbol `name` (or `libfile:name`).
@@ -383,12 +464,7 @@ impl LoadedTrace {
             raw_addr: format!("0x{:x}", w.addr),
             size: w.data.len(),
             value: self.render_value(u64::from_le_bytes(v), s),
-            kind: match w.kind {
-                WriteKind::Snapshot => "snapshot",
-                WriteKind::Instr => "instr",
-                WriteKind::Kernel => "kernel",
-                WriteKind::Unattributed => "unattributed",
-            },
+            kind: write_kind_name(w.kind),
         }
     }
 

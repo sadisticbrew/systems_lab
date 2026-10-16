@@ -1,7 +1,9 @@
 //! Analysis commands: `info`, `steps`, `stack`, `dot stack`, `check-abi`.
 
 mod abi;
+mod compare;
 mod dot;
+mod guide;
 mod info;
 mod stack;
 mod steps;
@@ -14,7 +16,9 @@ use anyhow::Result;
 use crate::model::LoadedTrace;
 
 pub use abi::check_abi;
+pub use compare::compare;
 pub use dot::dot_stack;
+pub use guide::check_guide;
 pub use info::info;
 pub use stack::stack;
 pub use steps::{StepsOptions, steps};

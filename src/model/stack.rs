@@ -33,6 +33,11 @@ pub struct FrameView {
     /// Highest address first. A frame of more than 512 slots lists its first and last 256 and puts one
     /// placeholder slot (label `… N slots (M bytes) not shown`, empty values) between them.
     pub slots: Vec<SlotView>,
+    /// The step of the `call` (or signal delivery) that created the frame; `None` for the root.
+    pub call_step: Option<u32>,
+    /// The step of the `ret` that closed the frame; `None` for the root and for a frame that does not
+    /// return within the recording.
+    pub ret_step: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +75,15 @@ impl Ctx<'_> {
 
     fn innermost(&self, k: usize) -> bool {
         k + 1 == self.chain.len()
+    }
+
+    /// The steps of the call that created activation `k` and of the `ret` that closed it; none for the root.
+    fn call_ret(&self, k: usize) -> (Option<u32>, Option<u32>) {
+        if k == 0 {
+            return (None, None);
+        }
+        let a = self.act(k);
+        (Some(a.call_step), a.ret_step)
     }
 
     /// The pc used to find the function and DWARF scope of activation `k`.
@@ -164,6 +178,28 @@ impl LoadedTrace {
     /// The stack at `state(s)`. `frames` limits the shown non-root activations (default: all);
     /// `root` decides whether the root activation is expanded or collapsed when `frames` is not set.
     pub fn stack_view(&self, s: u32, frames: Option<usize>, root: RootFrame) -> StackView {
+        let ctx = self.ctx_at(s);
+        let (s, now) = (ctx.s, ctx.now);
+        let nonroot = ctx.chain.len() - 1;
+        let shown = frames.map_or(nonroot, |f| f.min(nonroot));
+        let (collapsed, mut out) = if frames.is_none() && (root == RootFrame::Always || nonroot == 0) {
+            (0, Vec::new())
+        } else {
+            let collapsed = ctx.chain.len() - shown;
+            let kc = collapsed - 1;
+            let (call_step, ret_step) = ctx.call_ret(kc);
+            let row = FrameView { label: ctx.label(kc), func: ctx.func_name(kc), collapsed: true, size: None, slots: Vec::new(), call_step, ret_step };
+            (collapsed, vec![row])
+        };
+        let rsp_slot = now.rsp() & !7;
+        for k in collapsed..ctx.chain.len() {
+            out.push(self.frame_view(&ctx, k, rsp_slot));
+        }
+        StackView { step: s, loc: self.loc(now.rip), asm: self.asm_at(s), frames: out }
+    }
+
+    /// The activation chain and registers at `state(s)`.
+    fn ctx_at(&self, s: u32) -> Ctx<'_> {
         let s = s.min(self.n);
         let mut chain = Vec::new();
         let mut id = Some(self.acts.act_at[s as usize]);
@@ -172,22 +208,20 @@ impl LoadedTrace {
             id = self.acts.list[i as usize].parent;
         }
         chain.reverse();
-        let now = self.regs_at(s);
-        let ctx = Ctx { lt: self, s, chain, now };
-        let nonroot = ctx.chain.len() - 1;
-        let shown = frames.map_or(nonroot, |f| f.min(nonroot));
-        let (collapsed, mut out) = if frames.is_none() && (root == RootFrame::Always || nonroot == 0) {
-            (0, Vec::new())
-        } else {
-            let collapsed = ctx.chain.len() - shown;
-            let kc = collapsed - 1;
-            (collapsed, vec![FrameView { label: ctx.label(kc), func: ctx.func_name(kc), collapsed: true, size: None, slots: Vec::new() }])
-        };
-        let rsp_slot = now.rsp() & !7;
-        for k in collapsed..ctx.chain.len() {
-            out.push(self.frame_view(&ctx, k, rsp_slot));
-        }
-        StackView { step: s, loc: self.loc(now.rip), asm: self.asm_at(s), frames: out }
+        Ctx { lt: self, s, chain, now: self.regs_at(s) }
+    }
+
+    /// The DWARF variable `name` in scope at `rip` of the innermost activation at `state(s)`, with its
+    /// address computed from that activation's frame base. Of several variables with that name in scope
+    /// (shadowing), the one declared in the narrowest scope.
+    pub fn var_at(&self, s: u32, name: &str) -> Option<(u64, &DwVar)> {
+        let ctx = self.ctx_at(s);
+        let pc = ctx.now.rip;
+        let f = self.dwarf.func_at(pc)?;
+        let fb = ctx.frame_base(ctx.chain.len() - 1, f)?;
+        let width = |v: &DwVar| if v.scope.is_empty() { u64::MAX } else { v.scope.iter().map(|&(a, b)| b - a).sum() };
+        let v = f.vars_at(pc).filter(|v| v.name == name).min_by_key(|v| width(v))?;
+        Some((fb.wrapping_add_signed(v.fbreg), v))
     }
 
     fn frame_view(&self, ctx: &Ctx<'_>, k: usize, rsp_slot: u64) -> FrameView {
@@ -260,6 +294,9 @@ impl LoadedTrace {
                 } else {
                     format!("saved %{reg}")
                 }
+            } else if k == 0 && act.ret_slot.is_none() && addr == top && w.is_none() {
+                // Recorded from the entry point: the kernel put argc at the initial %rsp.
+                format!("argc = {value}")
             } else if let Some(l) = self.var_label(&vars, addr, act.call_step, s) {
                 l
             } else if written {
@@ -293,7 +330,8 @@ impl LoadedTrace {
                 }
             }
         }
-        FrameView { label: ctx.label(k), func: ctx.func_name(k), collapsed: false, size: Some(count * 8), slots }
+        let (call_step, ret_step) = ctx.call_ret(k);
+        FrameView { label: ctx.label(k), func: ctx.func_name(k), collapsed: false, size: Some(count * 8), slots, call_step, ret_step }
     }
 
     /// Rule 3: DWARF variables overlapping the slot at `addr`. A variable counts as written when the

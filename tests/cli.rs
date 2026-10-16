@@ -200,45 +200,6 @@ fn info_text_has_the_contract_keys() {
     assert!(sys.contains("write×1") && sys.contains("exit_group×1"), "{sys}");
 }
 
-/// A running `systemslab view`, killed on drop.
-struct Viewer {
-    child: std::process::Child,
-    port: u16,
-}
-
-impl Drop for Viewer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn start_viewer(trace: &std::path::Path) -> Viewer {
-    use std::io::BufRead;
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_systemslab"))
-        .args(["view", p(trace), "--no-open", "--port", "0"])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn view");
-    let mut line = String::new();
-    std::io::BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut line).unwrap();
-    let port = line.split("127.0.0.1:").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|p| p.parse().ok()).expect(&line);
-    Viewer { child, port }
-}
-
-/// One `GET` over a fresh connection: status code and body. Fails if the server stays silent for 20 s.
-fn http_get(v: &Viewer, path: &str) -> (u16, String) {
-    use std::io::{Read, Write};
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", v.port)).unwrap();
-    s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
-    write!(s, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", v.port).unwrap();
-    let mut raw = Vec::new();
-    s.read_to_end(&mut raw).unwrap_or_else(|e| panic!("GET {path}: {e}"));
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let (head, body) = text.split_once("\r\n\r\n").unwrap_or_else(|| panic!("GET {path}: no response"));
-    (head.split_whitespace().nth(1).unwrap().parse().unwrap(), body.to_string())
-}
-
 #[test]
 fn viewer_answers_hostile_requests_with_the_documented_status() {
     let (_b, t) = fact_trace();

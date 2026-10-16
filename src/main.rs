@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use systemslab::{cli, exit, record, server};
+use systemslab::{cli, exit, experiments, record, server};
 
 #[derive(Parser)]
 #[command(name = "systemslab", version, about = "Record real x86-64 executions and inspect them")]
@@ -82,6 +82,23 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Check that every directive of a guide resolves in a trace and show the values it asks about
+    CheckGuide {
+        trace: PathBuf,
+        /// A Markdown guide with `@go` and `@predict` directives
+        guide: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare two recordings: steps, output, syscalls, calls per function and the first point where they diverge
+    Compare {
+        /// The recording shown as A
+        a: PathBuf,
+        /// The recording shown as B
+        b: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Open a trace in the browser viewer
     View {
         /// A .slt trace, or a lab directory whose out/ holds one
@@ -92,6 +109,61 @@ enum Command {
         /// Do not launch a browser
         #[arg(long)]
         no_open: bool,
+        /// Open at this moment: `step:N`, `step:end`, `FILE:LINE[@K]`, `SYMBOL[+OFFSET][@K]` or `0xADDR[@K]`
+        #[arg(long, value_name = "LOCATOR")]
+        at: Option<String>,
+        /// Markdown guide to show (default: PATH/guide.md for a lab directory, else TRACE.guide.md next to the trace)
+        #[arg(long)]
+        guide: Option<PathBuf>,
+    },
+    /// Compile a C or assembly source, record it and open it in the viewer; saving the source rebuilds it
+    Run {
+        /// A .c, .s or .S source file
+        source: PathBuf,
+        /// Optimization level passed to the compiler
+        #[arg(short = 'O', value_name = "LEVEL", default_value = "0", value_parser = ["0", "1", "2", "3", "s", "g"])]
+        opt: String,
+        /// Where to start recording: auto, main, entry, or a symbol of the executable
+        #[arg(long, default_value = "auto")]
+        from: String,
+        /// Stop after this many steps
+        #[arg(long, default_value_t = 2_000_000)]
+        max_steps: u64,
+        /// Trace file to write (default: SOURCE with the extension .slt)
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
+        /// Markdown guide to show (default: SOURCE with the extension .guide.md, if it exists)
+        #[arg(long)]
+        guide: Option<PathBuf>,
+        /// Port to listen on (default: any free port)
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Do not launch a browser
+        #[arg(long)]
+        no_open: bool,
+        /// Record and exit without starting the viewer
+        #[arg(long)]
+        no_view: bool,
+        /// Do not rebuild when the source changes
+        #[arg(long)]
+        no_watch: bool,
+        /// Arguments of the program, after `--`
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// List the bundled experiments, or run one with its guide
+    Try {
+        /// Experiment name; omit to list them
+        name: Option<String>,
+        /// Port to listen on (default: any free port)
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Do not launch a browser
+        #[arg(long)]
+        no_open: bool,
+        /// Record and exit without starting the viewer
+        #[arg(long)]
+        no_view: bool,
     },
 }
 
@@ -119,7 +191,31 @@ fn run(cli: Cli) -> anyhow::Result<u8> {
         Command::Stack { trace, loc, frames, json } => cli::stack(&trace, &loc, frames, json),
         Command::Dot { figure: DotFigure::Stack { trace, loc, frames } } => cli::dot_stack(&trace, &loc, frames),
         Command::CheckAbi { trace, all, json } => cli::check_abi(&trace, all, json),
-        Command::View { path, port, no_open } => server::view(&path, port, no_open),
+        Command::CheckGuide { trace, guide, json } => cli::check_guide(&trace, &guide, json),
+        Command::Compare { a, b, json } => cli::compare(&a, &b, json),
+        Command::View { path, port, no_open, at, guide } => {
+            let trace_path = server::resolve_trace(&path)?;
+            let guide = guide.or_else(|| server::discover_guide(&path, &trace_path));
+            server::serve(server::ServeOptions { trace_path, guide, at, port, no_open, mode: server::Mode::View })
+        }
+        Command::Run { source, opt, from, max_steps, output, guide, port, no_open, no_view, no_watch, args } => {
+            systemslab::run::run(systemslab::run::RunOptions {
+                source,
+                opt,
+                from,
+                max_steps,
+                output,
+                guide,
+                port,
+                no_open,
+                no_view,
+                no_watch,
+                args,
+            })
+        }
+        Command::Try { name, port, no_open, no_view } => {
+            experiments::try_experiment(experiments::TryOptions { name, port, no_open, no_view })
+        }
     }
 }
 

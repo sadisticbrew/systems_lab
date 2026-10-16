@@ -29,6 +29,8 @@ pub struct Activations {
     pub act_at: Vec<u32>,
     /// Activation depth at every state `0..=N`.
     pub depth: Vec<u32>,
+    /// `(ret step, activation index)` of every closed activation, sorted.
+    pub by_ret: Vec<(u32, u32)>,
 }
 
 pub fn build(lt: &LoadedTrace) -> Activations {
@@ -126,5 +128,49 @@ pub fn build(lt: &LoadedTrace) -> Activations {
         act_at.push(top);
         depth.push(list[top as usize].depth);
     }
-    Activations { list, act_at, depth }
+    let mut by_ret: Vec<(u32, u32)> = list.iter().enumerate().filter_map(|(i, a)| a.ret_step.map(|r| (r, i as u32))).collect();
+    by_ret.sort_unstable();
+    Activations { list, act_at, depth, by_ret }
+}
+
+impl Activations {
+    /// The step of the call (or signal delivery) whose activation the `ret` at `ret_step` closed.
+    pub fn closing_call(&self, ret_step: u32) -> Option<u32> {
+        let i = self.by_ret.binary_search_by_key(&ret_step, |&(r, _)| r).ok()?;
+        Some(self.list[self.by_ret[i].1 as usize].call_step)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::model::LoadedTrace;
+    use crate::record::{Options, record};
+
+    /// `tests/fixtures/labels.s` calls `helper` three times; every `ret` names the `call` it closes.
+    #[test]
+    fn closing_call_names_the_call_a_ret_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/labels.s");
+        let exe = dir.path().join("labels");
+        let gcc = std::process::Command::new("gcc").args(["-nostdlib", "-static", "-o"]).arg(&exe).arg(&src).output().expect("gcc on PATH");
+        assert!(gcc.status.success(), "{}", String::from_utf8_lossy(&gcc.stderr));
+        let opts = Options {
+            from: "auto".into(),
+            max_steps: 10_000,
+            strict: true,
+            quiet: true,
+            output: dir.path().join("labels.slt"),
+            program: exe.to_string_lossy().into_owned(),
+            args: Vec::new(),
+        };
+        let lt = LoadedTrace::from_trace(record(&opts).unwrap().trace).unwrap();
+        for k in 1..=3 {
+            // `helper` is a single `ret`, so its k-th execution is the ret step.
+            let (call, ret) = (lt.locate(&format!("again@{k}")).unwrap(), lt.locate(&format!("helper@{k}")).unwrap());
+            assert_eq!(lt.acts.closing_call(ret), Some(call), "call {k}");
+        }
+        // Only a `ret` closes an activation: a call, or a step past the end, closes nothing.
+        assert_eq!(lt.acts.closing_call(lt.locate("again@1").unwrap()), None);
+        assert_eq!(lt.acts.closing_call(lt.steps() + 5), None);
+    }
 }

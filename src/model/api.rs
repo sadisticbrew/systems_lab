@@ -5,7 +5,7 @@ use iced_x86::{Decoder, DecoderOptions};
 
 use super::asm::Fmt;
 use super::views::*;
-use super::{FLAGS, LoadedTrace, RootFrame, flag_names};
+use super::{FLAGS, LoadedTrace, NavOp, RootFrame, flag_names};
 use crate::exit;
 use crate::trace::{EventKind, reg};
 
@@ -19,7 +19,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 impl LoadedTrace {
-    fn check_step(&self, s: u32) -> Result<()> {
+    pub(super) fn check_step(&self, s: u32) -> Result<()> {
         if s > self.n {
             return Err(exit::usage(format!("step {s} is outside 0..={}", self.n)));
         }
@@ -51,6 +51,7 @@ impl LoadedTrace {
     pub fn state_view(&self, s: u32) -> Result<StateView> {
         self.check_step(s)?;
         let regs = self.regs_at(s);
+        let prev_regs = (s > 0).then(|| self.regs_at(s - 1));
         let changed: Vec<u8> = if s == 0 { Vec::new() } else { self.deltas_of_step(s - 1).iter().map(|d| d.reg).collect() };
         let reg_views = REG_ORDER
             .iter()
@@ -61,7 +62,9 @@ impl LoadedTrace {
                     reg::RFLAGS => format!("[{}]", flag_names(v).join(" ")),
                     _ => self.render_value(v, s),
                 };
-                RegView { name: reg::name(id), value: format!("0x{v:x}"), rendered, changed: changed.contains(&id) }
+                let changed = changed.contains(&id);
+                let prev = prev_regs.as_ref().filter(|_| changed).map(|p| format!("0x{:x}", p.get(id) as u64));
+                RegView { name: reg::name(id), value: format!("0x{v:x}"), rendered, changed, prev }
             })
             .collect();
         let flags = OrderedMap(FLAGS.iter().map(|&(n, bit)| (n.to_string(), (regs.rflags >> bit & 1) as u8)).collect());
@@ -80,14 +83,6 @@ impl LoadedTrace {
                 None => String::new(),
             }
         };
-        let (writes, event) = if s < self.n {
-            (
-                self.writes_of_step(s).iter().map(|w| self.write_view(w, s + 1)).collect(),
-                self.event_of(s).map(|e| self.event_view(e)),
-            )
-        } else {
-            (Vec::new(), None)
-        };
         let prev_writes = if s > 0 { self.writes_of_step(s - 1).iter().map(|w| self.write_view(w, s)).collect() } else { Vec::new() };
         Ok(StateView {
             step: s,
@@ -95,28 +90,47 @@ impl LoadedTrace {
             loc: self.loc(regs.rip),
             asm: self.asm_at(s),
             bytes,
+            locator: self.locator_of(s),
             source: self.source_ref(self.line_of_state(s)),
             regs: reg_views,
             flags,
             xmm,
-            writes,
             prev_writes,
-            event,
+            effects: self.effects(s),
             depth: self.acts.depth[s as usize],
             stack: self.stack_view(s, None, RootFrame::Always),
         })
     }
 
-    /// `GET /api/timeline`.
-    pub fn timeline(&self) -> Timeline {
-        let n = self.n as usize;
-        let buckets = n.min(1000);
-        let mut depth = vec![0u32; buckets];
-        for (b, slot) in depth.iter_mut().enumerate() {
-            let lo = b * n / buckets;
-            let hi = ((b + 1) * n / buckets).max(lo + 1).min(n + 1);
-            *slot = self.acts.depth[lo..hi].iter().copied().max().unwrap_or(0);
+    /// `GET /api/timeline`: the states `from..=to`, at most 1000 depth buckets, and the markers inside.
+    pub fn timeline(&self, from: u32, to: u32) -> Result<Timeline> {
+        if from > to || to > self.n {
+            return Err(exit::usage(format!("timeline window {from}..={to} is not within 0..={}", self.n)));
         }
+        let count = (to - from) as usize + 1;
+        let buckets = count.min(1000);
+        let depth = (0..buckets)
+            .map(|b| {
+                let lo = from as usize + b * count / buckets;
+                let hi = from as usize + (b + 1) * count / buckets;
+                self.acts.depth[lo..hi].iter().copied().max().unwrap_or(0)
+            })
+            .collect();
+        let all = self.markers.get_or_init(|| self.compute_markers());
+        let lo = all.partition_point(|m| m.step < from);
+        let hi = all.partition_point(|m| m.step <= to);
+        Ok(Timeline { steps: self.n, from, to, depth, markers: all[lo..hi].to_vec() })
+    }
+
+    /// `GET /api/nav`: `nav` plus the `loc` and `asm` of the state it lands on.
+    pub fn nav_view(&self, from: u32, op: &NavOp) -> Result<NavView> {
+        let step = self.nav(from, op)?;
+        Ok(NavView { step, loc: step.map(|t| self.loc(self.rip_at(t))), asm: step.map(|t| self.asm_at(t)) })
+    }
+
+    /// Call, ret, syscall, signal and ABI markers ordered by step; the part of the timeline that does not
+    /// depend on the window.
+    fn compute_markers(&self) -> Vec<Marker> {
         let mut markers = Vec::new();
         for act in self.acts.list.iter().skip(1) {
             if !(self.syms.in_exe(self.rip_at(act.call_step)) || self.syms.in_exe(act.entry)) {
@@ -138,7 +152,7 @@ impl LoadedTrace {
             markers.push(Marker { step: f.step, kind: "abi", label: f.rule.to_string() });
         }
         markers.sort_by_key(|m| m.step);
-        Timeline { steps: self.n, depth, markers }
+        markers
     }
 
     /// `GET /api/mem`.
@@ -157,12 +171,15 @@ impl LoadedTrace {
         let mut fmt = Fmt::new(&self.syms);
         let mut lines = Vec::new();
         let mut push = |this: &Self, fmt: &mut Fmt, at: u64, bytes: &[u8], ins: &iced_x86::Instruction| {
+            let line = this.dwarf.line_at(at);
             lines.push(DisasmLine {
                 addr: format!("0x{at:x}"),
                 loc: this.loc(at),
                 bytes: hex(bytes),
                 asm: fmt.asm(ins),
-                source_line: this.dwarf.line_at(at).map(|(_, l)| l),
+                source_line: line.map(|(_, l)| l),
+                source_file: line.map(|(f, _)| this.file_display[f as usize].clone()),
+                hits: this.insn_by_addr.get(&at).map_or(0, |&i| this.occ[i as usize].len() as u32),
             });
         };
         let sym = self.syms.symbol_at(addr);

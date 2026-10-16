@@ -276,6 +276,8 @@ pub enum EventKind {
     Signal { signo: i32, code: i32, addr: u64 },
 }
 
+/// Writes the trace to `path` atomically (a temp file renamed into place), so a viewer watching
+/// `path` never reads a partial trace.
 pub fn save(path: &Path, trace: &Trace) -> Result<()> {
     let body = postcard::to_stdvec(trace).context("serializing trace")?;
     let packed = zstd::encode_all(&body[..], 3).context("compressing trace")?;
@@ -283,7 +285,7 @@ pub fn save(path: &Path, trace: &Trace) -> Result<()> {
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&packed);
-    std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))
+    crate::paths::write_atomic(path, &out).with_context(|| format!("writing {}", path.display()))
 }
 
 pub fn load(path: &Path) -> Result<Trace> {

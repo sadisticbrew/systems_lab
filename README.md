@@ -83,6 +83,13 @@ fact(3), 32 bytes
 $ systemslab view fact.slt     # prints the viewer's URL and opens it in your browser
 ```
 
+`systemslab run` does all three steps at once: it compiles the source with the flags below,
+records it, and opens the viewer, which rebuilds and re-records whenever you save the file:
+
+```console
+$ systemslab run fact.c
+```
+
 - `-O0 -g` gives ordinary frame-pointer frames and the debug info that names `n`.
 - `-fcf-protection=none` drops the `endbr64` that would otherwise start every function.
 
@@ -100,10 +107,15 @@ nature (such as stack canaries) print as hex and can differ.
 | Locator | Meaning |
 |---|---|
 | `step:28` | step 28 |
+| `step:end` | the final state, after the last instruction |
 | `fact` | the first time the first instruction of `fact` is about to run |
 | `fact+0xc@3` | the third time the instruction at `fact+0xc` is about to run |
+| `fact.c:4@3` | the third time execution enters line 4 of `fact.c` |
+| `printf@plt` | the PLT stub through which the program calls `printf` |
 | `libc.so.6:printf` | a symbol in a shared library |
 | `0x401136@2` | the second time the instruction at that address is about to run |
+
+Source-line locators survive recompiling with other flags; `SYMBOL+0xOFF` locators do not.
 
 To find offsets, list the steps of a function:
 
@@ -131,7 +143,11 @@ and its memory writes as `address←value/size`.
 | `stack TRACE LOC [--frames N] [--json]` | Show the stack frames and slots at a step. |
 | `dot stack TRACE LOC [--frames N]` | Write the same stack as a Graphviz figure, without colors or fonts so your own theme applies. |
 | `check-abi TRACE [--all] [--json]` | Check the recorded calls for System V ABI violations. |
-| `view PATH [--port P] [--no-open]` | Serve the browser viewer for a trace, or for a lab directory whose `out/` holds one trace. |
+| `check-guide TRACE GUIDE [--json]` | Check that every `@go` and `@predict` directive of a guide resolves in a trace, and print the step and recorded value each one points at. Exits 1 when a directive fails. |
+| `compare A.slt B.slt [--json]` | Compare two recordings, for example of one program built with `-O0` and `-O2`: steps, how they ended, whether the output and syscall sequences are the same, calls and steps per function, and the first call, syscall or signal where they diverge. |
+| `view PATH [--port P] [--no-open] [--at LOC] [--guide FILE]` | Serve the browser viewer for a trace, or for a lab directory whose `out/` holds one trace. `--at` opens it at a locator. The viewer reloads when the trace file is replaced. |
+| `run SOURCE [-O LEVEL] [--from WHERE] [--max-steps N] [-o TRACE] [--guide FILE] [--port P] [--no-open] [--no-view] [--no-watch] [-- ARGS...]` | Compile a `.c`, `.s` or `.S` file with `gcc -O0 -g -fcf-protection=none` (`$CC` overrides gcc), record it next to the source (`fact.c` → `fact` and `fact.slt`), and open the viewer. Saving the source rebuilds and re-records it; a build error is shown in the viewer while the previous recording stays loaded. Assembly that defines `_start` is linked with `-nostdlib -static`. |
+| `try [NAME] [--port P] [--no-open] [--no-view]` | List the bundled experiments, or copy one to `~/.local/share/systemslab/experiments/NAME/` (only files you do not have yet, so your edits stay) and `run` it with its guide. |
 
 `check-abi` checks four things for calls in the main executable (`--all` checks every call):
 
@@ -152,7 +168,7 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | ok |
-| 1 | `check-abi` found violations |
+| 1 | `check-abi` found violations, or `check-guide` found a directive that does not resolve |
 | 2 | usage, file or locator error |
 | 3 | the program did something unsupported (threads, `fork`, `exec`, stopping itself) |
 | 4 | `--strict` found memory changes it could not attribute |
@@ -178,6 +194,17 @@ Most of the value is in going backwards:
 | `o` / `O` | step out of the function, forwards or backwards |
 | `g` | type a locator |
 | `Home` / `End` | first or last step |
+
+## Guides and expressions
+
+A guide is a Markdown file the viewer shows in its Guide tab (`view --guide FILE`, `run --guide FILE`, or `NAME.guide.md` next to the trace). Two directives, each alone on a line starting in column 0, make it interactive:
+
+- `@go LOCATOR` is a button that jumps to that moment.
+- `@predict EXPR [as TYPE] at LOCATOR [after]` asks the learner for the value of `EXPR` before showing the recorded one. With `after` it is the value after the instruction at `LOCATOR` ran. The lines starting with `> ` that follow explain the answer and stay hidden until it is checked.
+
+`systemslab check-guide` resolves every directive against a recording, so a guide that stops matching its program is caught before a learner sees it.
+
+Expressions are used by guides, the viewer's watch list and its memory address box. They are made of registers of any width (`rax`, `%eax`, `al`, `rip`, `rflags`), C variables in scope (`n`, which evaluates to its address), symbols (`printf@plt`, `libc.so.6:printf`), `stack0` and `heap`, numbers, `+`, `-`, `mod`, and AT&T memory operands such as `-0x8(%rbp)` or `(%rax,%rcx,8)`. A memory operand is an address, so `-0x8(%rbp) as i64` reads the 8 bytes there. `TYPE` is one of `value` (the expression's own value), `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `u64`, `i64`, `f32`, `f64`, `ptr`, `str` or `bytes`. Without it, a C variable is read as its declared type, a memory operand or symbol as a pointer, and anything else as a value.
 
 ## How it works
 
@@ -244,7 +271,9 @@ Layout:
 | `src/record/` | ptrace recorder |
 | `src/trace/format.rs` | the `.slt` file format |
 | `src/model/` | state reconstruction, symbols, DWARF, activations, stack view, ABI rules, navigation |
+| `src/run.rs`, `src/experiments.rs` | the `run` and `try` commands |
+| `experiments/` | the programs and guides `try` bundles |
 | `src/cli/` | text and JSON output of the commands |
-| `src/server/` | HTTP API and embedded viewer assets |
+| `src/server/` | HTTP API, file watcher and embedded viewer assets |
 | `web/` | Svelte 5 viewer |
 | `tests/` | integration tests that compile and record the programs in `tests/fixtures/` |

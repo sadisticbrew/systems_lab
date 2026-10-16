@@ -3,9 +3,12 @@ use std::process::Command;
 use std::{env, fs};
 
 const UNISTD: &str = "/usr/include/asm/unistd_64.h";
+const ERRNO_HEADERS: [&str; 2] = ["/usr/include/asm-generic/errno-base.h", "/usr/include/asm-generic/errno.h"];
 
 fn main() {
     syscall_table();
+    errno_table();
+    println!("cargo:rerun-if-changed=experiments");
     viewer_assets();
 }
 
@@ -36,6 +39,35 @@ fn syscall_table() {
     }
     out.push_str("];\n");
     let dest = PathBuf::from(env::var("OUT_DIR").unwrap()).join("syscalls.rs");
+    fs::write(dest, out).unwrap();
+}
+
+/// `$OUT_DIR/errno.rs`: `ERRNO_NAMES` (number, name, text), sorted by number, from the
+/// `#define NAME NUMBER /* TEXT */` lines of the asm-generic errno headers.
+fn errno_table() {
+    let mut table: Vec<(i64, String, String)> = Vec::new();
+    for header in ERRNO_HEADERS {
+        println!("cargo:rerun-if-changed={header}");
+        match fs::read_to_string(header) {
+            Ok(text) => table.extend(text.lines().filter_map(|line| {
+                let rest = line.strip_prefix("#define")?;
+                let mut parts = rest.split_whitespace();
+                let name = parts.next()?;
+                let nr = parts.next()?.parse().ok()?;
+                let text = rest.split_once("/*")?.1.split_once("*/")?.0.trim();
+                Some((nr, name.to_string(), text.to_string()))
+            })),
+            Err(err) => println!("cargo:warning=cannot read {header} ({err}); errno names will be numeric"),
+        }
+    }
+    table.sort_by_key(|(nr, ..)| *nr);
+    table.dedup_by_key(|(nr, ..)| *nr);
+    let mut out = String::from("pub static ERRNO_NAMES: &[(i64, &str, &str)] = &[\n");
+    for (nr, name, text) in &table {
+        out.push_str(&format!("    ({nr}, {name:?}, {text:?}),\n"));
+    }
+    out.push_str("];\n");
+    let dest = PathBuf::from(env::var("OUT_DIR").unwrap()).join("errno.rs");
     fs::write(dest, out).unwrap();
 }
 
