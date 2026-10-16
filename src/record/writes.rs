@@ -12,6 +12,11 @@ use super::spawn::Tracee;
 #[derive(Default)]
 pub struct Plan {
     pub syscall: bool,
+    /// `int $0x80`: the 32-bit system call entry. The kernel may write memory, but the 64-bit
+    /// syscall table does not describe it, so only its memory effects are recorded, not an event.
+    pub legacy_syscall: bool,
+    /// `pushfq`: the real RFLAGS it stores contain the tracer's trap flag.
+    pub pushf: bool,
     /// Writes to ES:RDI (movs/stos/ins); its range comes from the rdi delta.
     pub string_elem: Option<u64>,
     /// push/pushf/call/enter: the stack bytes below the old rsp are written.
@@ -57,6 +62,8 @@ impl Insns {
             if !ins.is_invalid() {
                 len = ins.len();
                 plan.syscall = ins.mnemonic() == Mnemonic::Syscall;
+                plan.legacy_syscall = ins.mnemonic() == Mnemonic::Int && ins.immediate8() == 0x80;
+                plan.pushf = ins.mnemonic() == Mnemonic::Pushfq;
                 plan.rsp_union = matches!(
                     ins.mnemonic(),
                     Mnemonic::Push | Mnemonic::Pushfq | Mnemonic::Pushfd | Mnemonic::Pushf | Mnemonic::Call | Mnemonic::Enter
@@ -71,7 +78,9 @@ impl Insns {
                     if !write {
                         continue;
                     }
-                    let size = m.memory_size().size() as u64;
+                    // iced reports a rep-prefixed string write as a CondWrite of unknown size; the
+                    // element size is the instruction's own memory size.
+                    let size = if string { ins.memory_size().size() } else { m.memory_size().size() } as u64;
                     if size == 0 {
                         plan.unsized_write = true;
                     } else if string {

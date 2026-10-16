@@ -18,9 +18,10 @@
     const step = lab.step;
     if (!key || !r) return;
     untrack(() => {
+      // Bump first so a response still in flight for another function cannot replace a listing that already fits.
+      const id = ++seq;
       const have = dis && dis.func === key && dis.lines.some((l) => BigInt(l.addr) === BigInt(r));
       if (have) return;
-      const id = ++seq;
       api.disasm(r, step)
         .then((d) => { if (id === seq) dis = { ...d, func: key }; })
         .catch((e) => lab.fail(e));

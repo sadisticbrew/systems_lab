@@ -6,8 +6,6 @@
   let width = $state(0);
   let height = $state(0);
   let dragging = false;
-  let target: number | null = null;
-  let busy = false;
 
   $effect(() => {
     const ro = new ResizeObserver(() => {
@@ -56,22 +54,10 @@
     if (canvas) draw();
   });
 
-  async function pump() {
-    if (busy) return;
-    busy = true;
-    while (target !== null) {
-      const t = target;
-      target = null;
-      await lab.goto(t);
-    }
-    busy = false;
-  }
-
   function scrub(e: PointerEvent) {
     const r = canvas.getBoundingClientRect();
     const x = Math.max(0, Math.min(r.width, e.clientX - r.left));
-    target = Math.round((x / r.width) * lab.last);
-    pump();
+    lab.goto(Math.round((x / r.width) * lab.last));
   }
 </script>
 

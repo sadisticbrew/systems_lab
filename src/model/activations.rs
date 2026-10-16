@@ -17,6 +17,8 @@ pub struct Activation {
     pub ret_step: Option<u32>,
     /// `rip` right after the call (the root: `state(0).rip`).
     pub entry: u64,
+    /// Entered by the kernel delivering a signal to a handler rather than by a `call`.
+    pub signal: bool,
 }
 
 #[derive(Default)]
@@ -42,6 +44,7 @@ pub fn build(lt: &LoadedTrace) -> Activations {
         ret_addr: if root_known { lt.read_u64(0, start.rsp()).unwrap_or(0) } else { 0 },
         ret_step: None,
         entry: start.rip,
+        signal: false,
     }];
     let mut stack = vec![0u32];
     let mut act_at = Vec::with_capacity(n + 1);
@@ -52,7 +55,7 @@ pub fn build(lt: &LoadedTrace) -> Activations {
     let mut di = deltas.partition_point(|d| d.seq == 0);
     let (mut rsp, mut rip) = (start.rsp(), start.rip);
     for s in 0..n {
-        let rsp_before = rsp;
+        let (rsp_before, rip_before) = (rsp, rip);
         while di < deltas.len() && deltas[di].seq as usize <= s + 1 {
             match deltas[di].reg {
                 reg::RSP => rsp = deltas[di].value as u64,
@@ -74,6 +77,7 @@ pub fn build(lt: &LoadedTrace) -> Activations {
                     ret_addr: lt.read_u64(s as u32 + 1, rsp).unwrap_or(0),
                     ret_step: None,
                     entry: rip,
+                    signal: false,
                 });
                 stack.push(list.len() as u32 - 1);
             } else if info.ret {
@@ -91,6 +95,31 @@ pub fn build(lt: &LoadedTrace) -> Activations {
                     list[top as usize].ret_step = Some(s as u32);
                     stack.pop();
                 }
+            }
+        }
+        if matches!(step.kind, StepKind::Deliver { .. }) && rip != rip_before {
+            // The kernel enters the handler with the return address (the signal trampoline) on top of
+            // the stack, exactly as a `call` would.
+            let parent = *stack.last().unwrap();
+            list.push(Activation {
+                parent: Some(parent),
+                depth: list[parent as usize].depth + 1,
+                call_step: s as u32,
+                ret_slot: Some(rsp),
+                ret_addr: lt.read_u64(s as u32 + 1, rsp).unwrap_or(0),
+                ret_step: None,
+                entry: rip,
+                signal: true,
+            });
+            stack.push(list.len() as u32 - 1);
+        }
+        // A live activation keeps %rsp at or below its return slot. Above it, the frame is gone without
+        // a `ret` (longjmp, siglongjmp, a handler that never returns): discard it.
+        while let Some(&top) = stack.last() {
+            if top != 0 && list[top as usize].ret_slot.is_some_and(|r| r < rsp) {
+                stack.pop();
+            } else {
+                break;
             }
         }
         let top = *stack.last().unwrap();

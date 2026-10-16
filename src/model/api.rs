@@ -5,9 +5,12 @@ use iced_x86::{Decoder, DecoderOptions};
 
 use super::asm::Fmt;
 use super::views::*;
-use super::{FLAGS, LoadedTrace, flag_names};
+use super::{FLAGS, LoadedTrace, RootFrame, flag_names};
 use crate::exit;
 use crate::trace::{EventKind, reg};
+
+/// Largest symbol `disasm_view` decodes end to end.
+const MAX_DECODED_SYMBOL: u64 = 64 * 1024;
 
 const REG_ORDER: [u8; 20] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, reg::RIP, reg::RFLAGS, reg::FS_BASE, reg::GS_BASE];
 
@@ -85,6 +88,7 @@ impl LoadedTrace {
         } else {
             (Vec::new(), None)
         };
+        let prev_writes = if s > 0 { self.writes_of_step(s - 1).iter().map(|w| self.write_view(w, s)).collect() } else { Vec::new() };
         Ok(StateView {
             step: s,
             kind: self.step_kind(s),
@@ -96,9 +100,10 @@ impl LoadedTrace {
             flags,
             xmm,
             writes,
+            prev_writes,
             event,
             depth: self.acts.depth[s as usize],
-            stack: self.stack_view(s, None),
+            stack: self.stack_view(s, None, RootFrame::Always),
         })
     }
 
@@ -160,12 +165,14 @@ impl LoadedTrace {
                 source_line: this.dwarf.line_at(at).map(|(_, l)| l),
             });
         };
-        let func;
-        if let Some((sym, lib)) = self.syms.symbol_at(addr) {
-            func = match lib {
-                Some(l) => format!("{l}:{}", sym.name),
-                None => sym.name.clone(),
-            };
+        let sym = self.syms.symbol_at(addr);
+        let func = match sym {
+            Some((s, Some(l))) => format!("{l}:{}", s.name),
+            Some((s, None)) => s.name.clone(),
+            None => self.loc(addr),
+        };
+        // A bigger symbol (a data object, a bogus `.size`) lists only the executed instructions near `addr`.
+        if let Some((sym, _)) = sym.filter(|(s, _)| s.size <= MAX_DECODED_SYMBOL) {
             let code: Vec<u8> = self.read_mem(s, sym.addr, sym.size as usize).into_iter().map_while(|b| b).collect();
             let mut d = Decoder::with_ip(64, &code, sym.addr, DecoderOptions::NONE);
             let mut off = 0usize;
@@ -177,7 +184,6 @@ impl LoadedTrace {
                 off += len;
             }
         } else {
-            func = self.loc(addr);
             for &i in &self.insns_sorted {
                 let insn = &self.trace.insns[i as usize];
                 if insn.addr + 256 < addr || insn.addr > addr + 256 {

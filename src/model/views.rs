@@ -157,7 +157,10 @@ pub struct StateView {
     pub regs: Vec<RegView>,
     pub flags: OrderedMap<u8>,
     pub xmm: Vec<XmmView>,
+    /// Writes of the step about to run (`state(s)` to `state(s+1)`).
     pub writes: Vec<WriteView>,
+    /// Writes of the previous step, which produced `state(s)`; they match the registers' `changed` flags.
+    pub prev_writes: Vec<WriteView>,
     pub event: Option<EventView>,
     pub depth: u32,
     pub stack: super::stack::StackView,

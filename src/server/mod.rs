@@ -62,10 +62,19 @@ fn hex_addr(p: &HashMap<String, String>) -> Result<u64, ApiError> {
     u64::from_str_radix(a.strip_prefix("0x").unwrap_or(a), 16).map_err(|_| bad(format!("bad address '{a}'")))
 }
 
+/// Parses a step number. One too big for `u32` is out of range (404), other text a bad parameter (400).
+fn parse_step(t: &LoadedTrace, raw: &str, what: &str) -> Result<u32, ApiError> {
+    match raw.parse::<u32>() {
+        Ok(s) => check_step(t, s).map(|()| s),
+        Err(_) if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) => {
+            Err(ApiError(StatusCode::NOT_FOUND, format!("step {raw} is outside 0..={}", t.steps())))
+        }
+        Err(_) => Err(bad(format!("bad {what} '{raw}'"))),
+    }
+}
+
 fn step_param(t: &LoadedTrace, p: &HashMap<String, String>, key: &str) -> Result<u32, ApiError> {
-    let s: u32 = number(p, key)?;
-    check_step(t, s)?;
-    Ok(s)
+    parse_step(t, required(p, key)?, key)
 }
 
 fn check_step(t: &LoadedTrace, s: u32) -> Result<(), ApiError> {
@@ -84,8 +93,7 @@ async fn timeline(State(t): State<Shared>) -> ApiResult {
 }
 
 async fn state(State(t): State<Shared>, UrlPath(s): UrlPath<String>) -> ApiResult {
-    let s: u32 = s.parse().map_err(|_| bad(format!("bad step '{s}'")))?;
-    check_step(&t, s)?;
+    let s = parse_step(&t, &s, "step")?;
     ok(t.state_view(s).map_err(from_model)?)
 }
 

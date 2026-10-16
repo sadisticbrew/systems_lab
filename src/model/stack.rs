@@ -28,8 +28,10 @@ pub struct FrameView {
     pub label: String,
     pub func: String,
     pub collapsed: bool,
-    /// Bytes spanned by the slots; `None` for the collapsed row.
+    /// Bytes spanned by the frame (also the slots a huge frame does not list); `None` for the collapsed row.
     pub size: Option<u64>,
+    /// Highest address first. A frame of more than 512 slots lists its first and last 256 and puts one
+    /// placeholder slot (label `… N slots (M bytes) not shown`, empty values) between them.
     pub slots: Vec<SlotView>,
 }
 
@@ -40,6 +42,18 @@ pub struct StackView {
     pub asm: String,
     pub frames: Vec<FrameView>,
 }
+
+/// Whether `stack_view` expands the root activation (`main` when recording from `main`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootFrame {
+    /// Expand it only when it is the innermost activation; otherwise it stays a collapsed row.
+    WhenInnermost,
+    /// Always expand it (the viewer).
+    Always,
+}
+
+/// Most slots one frame lists; a bigger frame shows its first and last half and one row for the gap.
+const MAX_FRAME_SLOTS: u64 = 512;
 
 /// An activation chain at one state, outermost (root) first.
 struct Ctx<'a> {
@@ -60,7 +74,13 @@ impl Ctx<'_> {
 
     /// The pc used to find the function and DWARF scope of activation `k`.
     fn scope_pc(&self, k: usize) -> u64 {
-        if self.innermost(k) { self.now.rip } else { self.act(k + 1).ret_addr.wrapping_sub(1) }
+        if self.innermost(k) {
+            self.now.rip
+        } else if self.act(k + 1).signal {
+            self.lt.rip_at(self.act(k + 1).call_step)
+        } else {
+            self.act(k + 1).ret_addr.wrapping_sub(1)
+        }
     }
 
     fn regs(&self, k: usize) -> RegFile {
@@ -115,9 +135,10 @@ impl LoadedTrace {
         if size == 0 {
             return "?".into();
         }
-        let Some(b) = self.read_mem(s, addr, size).into_iter().collect::<Option<Vec<u8>>>() else { return "?".into() };
+        // Only the first 16 bytes are ever shown, however large the variable is.
+        let Some(b) = self.read_mem(s, addr, size.min(16)).into_iter().collect::<Option<Vec<u8>>>() else { return "?".into() };
         let mut raw = [0u8; 8];
-        let n = size.min(8);
+        let n = b.len().min(8);
         raw[..n].copy_from_slice(&b[..n]);
         let unsigned = u64::from_le_bytes(raw);
         match (v.enc, size) {
@@ -131,8 +152,8 @@ impl LoadedTrace {
             (Enc::Float, 8) => f64::from_bits(unsigned).to_string(),
             (Enc::Pointer, 8) => self.render_value(unsigned, s),
             _ => {
-                let mut out = b.iter().take(16).map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
-                if b.len() > 16 {
+                let mut out = b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ");
+                if size > 16 {
                     out.push_str(" …");
                 }
                 out
@@ -140,8 +161,9 @@ impl LoadedTrace {
         }
     }
 
-    /// The stack at `state(s)`. `frames` limits the shown non-root activations (default: all).
-    pub fn stack_view(&self, s: u32, frames: Option<usize>) -> StackView {
+    /// The stack at `state(s)`. `frames` limits the shown non-root activations (default: all);
+    /// `root` decides whether the root activation is expanded or collapsed when `frames` is not set.
+    pub fn stack_view(&self, s: u32, frames: Option<usize>, root: RootFrame) -> StackView {
         let s = s.min(self.n);
         let mut chain = Vec::new();
         let mut id = Some(self.acts.act_at[s as usize]);
@@ -154,9 +176,13 @@ impl LoadedTrace {
         let ctx = Ctx { lt: self, s, chain, now };
         let nonroot = ctx.chain.len() - 1;
         let shown = frames.map_or(nonroot, |f| f.min(nonroot));
-        let collapsed = ctx.chain.len() - shown;
-        let kc = collapsed - 1;
-        let mut out = vec![FrameView { label: ctx.label(kc), func: ctx.func_name(kc), collapsed: true, size: None, slots: Vec::new() }];
+        let (collapsed, mut out) = if frames.is_none() && (root == RootFrame::Always || nonroot == 0) {
+            (0, Vec::new())
+        } else {
+            let collapsed = ctx.chain.len() - shown;
+            let kc = collapsed - 1;
+            (collapsed, vec![FrameView { label: ctx.label(kc), func: ctx.func_name(kc), collapsed: true, size: None, slots: Vec::new() }])
+        };
         let rsp_slot = now.rsp() & !7;
         for k in collapsed..ctx.chain.len() {
             out.push(self.frame_view(&ctx, k, rsp_slot));
@@ -167,9 +193,18 @@ impl LoadedTrace {
     fn frame_view(&self, ctx: &Ctx<'_>, k: usize, rsp_slot: u64) -> FrameView {
         let s = ctx.s;
         let act = ctx.act(k);
-        let top = act.ret_slot.unwrap_or(rsp_slot);
-        let bottom = if ctx.innermost(k) { rsp_slot } else { ctx.act(k + 1).ret_slot.map_or(top, |r| r + 8) };
+        let top = act.ret_slot.unwrap_or(self.stack0 & !7);
+        let bottom = if ctx.innermost(k) {
+            rsp_slot
+        } else if ctx.act(k + 1).signal {
+            // Interrupted by a signal: the frame ends at the %rsp the kernel found.
+            self.regs_at(ctx.act(k + 1).call_step).rsp() & !7
+        } else {
+            ctx.act(k + 1).ret_slot.map_or(top, |r| r + 8)
+        };
         let count = if bottom <= top { (top - bottom) / 8 + 1 } else { 1 };
+        // A frame this large (an array on the stack) lists only its first and last slots.
+        let (head, tail) = if count > MAX_FRAME_SLOTS { (MAX_FRAME_SLOTS / 2, MAX_FRAME_SLOTS / 2) } else { (count, 0) };
         let pc = ctx.scope_pc(k);
         let dw = self.dwarf.func_at(pc);
         let fb = dw.and_then(|f| ctx.frame_base(k, f));
@@ -178,8 +213,26 @@ impl LoadedTrace {
             _ => Vec::new(),
         };
         let mut slots: Vec<SlotView> = Vec::new();
+        let mut slot_addrs: Vec<u64> = Vec::new();
+        let mut gap = None;
         let mut saved_rbp_addr = None;
-        for i in 0..count {
+        for i in (0..head).chain(count - tail..count) {
+            if tail > 0 && i == count - tail {
+                let skipped = count - head - tail;
+                let first = top - 8 * head;
+                gap = Some(slots.len());
+                slot_addrs.push(first);
+                slots.push(SlotView {
+                    addr: self.render_value(first, s),
+                    raw_addr: format!("0x{first:x}"),
+                    rbp_off: None,
+                    label: format!("… {skipped} slots ({} bytes) not shown", skipped * 8),
+                    value: String::new(),
+                    raw_value: String::new(),
+                    pointers: Vec::new(),
+                    writer: None,
+                });
+            }
             let addr = top - 8 * i;
             let (bytes, writers) = self.read_with_writers(s, addr, 8);
             let mut raw = [0u8; 8];
@@ -191,19 +244,23 @@ impl LoadedTrace {
             let written = w.is_some_and(|w| w >= act.call_step);
             let push_reg = w.filter(|_| written).and_then(|w| self.insn_info[self.trace.steps[w as usize].insn as usize].push_reg.clone());
             let label = if Some(addr) == act.ret_slot {
-                format!(
-                    "return address: {} in {}",
-                    self.mnemonic_at(act.ret_addr, s),
-                    self.func_name_at(act.ret_addr.wrapping_sub(1))
-                )
+                // A handler returns to the start of the signal trampoline, not just after a call.
+                let from = if act.signal { act.ret_addr } else { act.ret_addr.wrapping_sub(1) };
+                format!("return address: {} in {}", self.mnemonic_at(act.ret_addr, s), self.func_name_at(from))
             } else if let Some(reg) = push_reg {
                 if reg == "rbp" {
                     saved_rbp_addr.get_or_insert(addr);
-                    format!("saved %rbp: {}'s", ctx.label(k - 1))
+                    if k > 0 {
+                        format!("saved %rbp: {}'s", ctx.label(k - 1))
+                    } else if act.ret_slot.is_some() {
+                        format!("saved %rbp: {}'s", self.func_name_at(act.ret_addr.wrapping_sub(1)))
+                    } else {
+                        "saved %rbp".to_string()
+                    }
                 } else {
                     format!("saved %{reg}")
                 }
-            } else if let Some(l) = self.var_label(&vars, addr, written, s) {
+            } else if let Some(l) = self.var_label(&vars, addr, act.call_step, s) {
                 l
             } else if written {
                 self.render_value(value, s)
@@ -217,6 +274,7 @@ impl LoadedTrace {
             if addr == ctx.now.rbp() {
                 pointers.push("%rbp".to_string());
             }
+            slot_addrs.push(addr);
             slots.push(SlotView {
                 addr: self.render_value(addr, s),
                 raw_addr: format!("0x{addr:x}"),
@@ -229,21 +287,27 @@ impl LoadedTrace {
             });
         }
         if let Some(fp) = saved_rbp_addr {
-            for (i, slot) in slots.iter_mut().enumerate() {
-                let addr = top - 8 * i as u64;
-                slot.rbp_off = Some(format!("{}(%rbp)", addr.wrapping_sub(fp) as i64));
+            for (i, (slot, addr)) in slots.iter_mut().zip(&slot_addrs).enumerate() {
+                if Some(i) != gap {
+                    slot.rbp_off = Some(format!("{}(%rbp)", addr.wrapping_sub(fp) as i64));
+                }
             }
         }
-        FrameView { label: ctx.label(k), func: ctx.func_name(k), collapsed: false, size: Some(slots.len() as u64 * 8), slots }
+        FrameView { label: ctx.label(k), func: ctx.func_name(k), collapsed: false, size: Some(count * 8), slots }
     }
 
-    /// Rule 3: DWARF variables overlapping the slot at `addr`.
-    fn var_label(&self, vars: &[(&DwVar, u64)], addr: u64, written: bool, s: u32) -> Option<String> {
+    /// Rule 3: DWARF variables overlapping the slot at `addr`. A variable counts as written when the
+    /// activation (entered at step `call_step`) wrote its own first byte; it may sit anywhere in the slot.
+    fn var_label(&self, vars: &[(&DwVar, u64)], addr: u64, call_step: u32, s: u32) -> Option<String> {
         let parts: Vec<String> = vars
             .iter()
             .filter(|(v, va)| *va < addr + 8 && *va + v.size.max(1) > addr)
             .map(|(v, va)| {
-                if written { format!("{} = {}", v.name, self.var_value(v, *va, s)) } else { format!("{}, not written yet", v.name) }
+                if self.last_writer(s, *va).is_some_and(|w| w >= call_step) {
+                    format!("{} = {}", v.name, self.var_value(v, *va, s))
+                } else {
+                    format!("{}, not written yet", v.name)
+                }
             })
             .collect();
         (!parts.is_empty()).then(|| parts.join(", "))

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use gimli::{EndianSlice, LittleEndian};
-use object::{BinaryFormat, Object, ObjectKind, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
+use object::{BinaryFormat, Object, ObjectKind, ObjectSection, ObjectSegment, ObjectSymbol, SectionKind, SymbolKind};
 
 use crate::trace::{LibSyms, Region, Source, Sym};
 
@@ -21,6 +21,9 @@ pub struct ExeInfo {
     /// ET_EXEC: loaded at its link address.
     pub fixed: bool,
     pub syms: Vec<Sym>,
+    /// Named symbols defined in code sections, whatever their type and size. A hand-written `main:`
+    /// label is NOTYPE with size 0, so it is missing from `syms` but is a valid start point.
+    pub starts: Vec<Sym>,
 }
 
 fn parse(bytes: &[u8]) -> Result<object::File<'_>> {
@@ -49,10 +52,32 @@ fn symbols(file: &object::File<'_>) -> Vec<Sym> {
     }
 }
 
+/// Defined symbols of code sections of any type and size, from `.symtab` if present, else `.dynsym`.
+fn code_symbols(file: &object::File<'_>) -> Vec<Sym> {
+    let collect = |iter: &mut dyn Iterator<Item = object::Symbol<'_, '_>>| -> Vec<Sym> {
+        iter.filter(|s| {
+            let in_code = s.section_index().and_then(|i| file.section_by_index(i).ok());
+            matches!(s.kind(), SymbolKind::Text | SymbolKind::Unknown)
+                && in_code.is_some_and(|sec| sec.kind() == SectionKind::Text)
+        })
+        .filter_map(|s| {
+            let name = s.name().ok()?;
+            (!name.is_empty()).then(|| Sym { name: name.to_string(), addr: s.address(), size: s.size() })
+        })
+        .collect()
+    };
+    if file.section_by_name(".symtab").is_some() {
+        collect(&mut file.symbols())
+    } else {
+        collect(&mut file.dynamic_symbols())
+    }
+}
+
 pub fn analyze(bytes: &[u8]) -> Result<ExeInfo> {
     let file = parse(bytes)?;
     let load_lo = file.segments().map(|s| s.address()).min().map_or(0, page_down);
-    Ok(ExeInfo { load_lo, fixed: file.kind() == ObjectKind::Executable, syms: symbols(&file) })
+    let fixed = file.kind() == ObjectKind::Executable;
+    Ok(ExeInfo { load_lo, fixed, syms: symbols(&file), starts: code_symbols(&file) })
 }
 
 /// Load bias of the mapped file at `path`: first offset-0 mapping minus the lowest PT_LOAD page.

@@ -154,7 +154,7 @@ Exit codes:
 | 0 | ok |
 | 1 | `check-abi` found violations |
 | 2 | usage, file or locator error |
-| 3 | the program did something unsupported (threads, `fork`, `exec`) |
+| 3 | the program did something unsupported (threads, `fork`, `exec`, stopping itself) |
 | 4 | `--strict` found memory changes it could not attribute |
 
 ## The viewer
@@ -196,15 +196,21 @@ Most of the value is in going backwards:
   about 1.4 MB.
 - **Reconstructing a state.** The state at any step is built from register checkpoints
   (one every 1,024 steps) plus deltas, and from the memory writes recorded up to that step.
-- **Stack frames.** Frames come from the recorded `call`/`ret` pairs, not from unwind
-  tables. Slot labels come from the recorded writes (a `push %rbp` is a saved `%rbp`) and
-  from the DWARF locations of parameters and local variables.
+- **Stack frames.** Frames come from the recorded `call`/`ret` pairs and from the kernel
+  entering signal handlers, not from unwind tables. A frame that is left without a `ret`
+  (`longjmp`) ends when `%rsp` moves above its return address. Slot labels come from the
+  recorded writes (a `push %rbp` is a saved `%rbp`) and from the DWARF locations of
+  parameters and local variables. A frame of more than 512 slots (a large array on the
+  stack) lists its first and last 256.
 
 ## Limitations
 
 - x86-64 Linux only.
 - Single-threaded programs only. `clone`, `fork`, `vfork` and `execve` stop the recording
-  with exit code 3.
+  with exit code 3. So does a program that stops itself with `SIGSTOP` or `SIGTSTP`,
+  because only another process could resume it.
+- 32-bit `int $0x80` system calls are recorded with their memory effects but without a
+  syscall name.
 - Single-stepping is slow: about 12 µs per instruction in a release build. Keep the
   programs you study small, or use `--from SYMBOL` to skip startup.
 - Variable names and values in stack labels need simple DWARF locations (`DW_OP_fbreg`),

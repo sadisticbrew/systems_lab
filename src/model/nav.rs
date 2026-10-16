@@ -68,9 +68,23 @@ impl LoadedTrace {
             NavOp::PrevLine => {
                 let line = self.line_of_state(from);
                 (0..from).rev().find(|&t| d[t as usize] <= dfrom && self.line_differs(t, line)).map(|mut t| {
-                    let l = self.line_of_state(t);
-                    while t > 0 && d[t as usize - 1] == d[t as usize] && self.line_of_state(t - 1) == l {
-                        t -= 1;
+                    // Walk back to where execution entered this line, skipping the calls it made.
+                    let (l, dt) = (self.line_of_state(t), d[t as usize]);
+                    while t > 0 {
+                        let p = t as usize - 1;
+                        if d[p] > dt {
+                            let Some(q) = (0..p).rev().find(|&q| d[q] <= dt) else { break };
+                            if d[q] == dt && self.line_of_state(q as u32) == l {
+                                t = q as u32;
+                                continue;
+                            }
+                            break;
+                        }
+                        if d[p] == dt && self.line_of_state(p as u32) == l {
+                            t = p as u32;
+                        } else {
+                            break;
+                        }
                     }
                     t
                 })

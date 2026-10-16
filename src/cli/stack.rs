@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use super::{load, with_stdout};
-use crate::model::StackView;
+use crate::model::{RootFrame, StackView};
 
 fn value_col(label: &str, value: &str) -> String {
     if label == "unused" { "-".to_string() } else { value.to_string() }
@@ -40,7 +40,7 @@ pub fn render_text(v: &StackView) -> String {
 pub fn stack(trace: &Path, loc: &str, frames: Option<usize>, json: bool) -> Result<u8> {
     let lt = load(trace)?;
     let s = lt.locate(loc)?;
-    let v = lt.stack_view(s, frames);
+    let v = lt.stack_view(s, frames, RootFrame::WhenInnermost);
     with_stdout(|out| {
         if json {
             writeln!(out, "{}", serde_json::to_string(&v)?)?;

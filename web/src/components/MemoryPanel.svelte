@@ -46,7 +46,7 @@
     const set = new Set<string>();
     if (!mem) return set;
     const start = BigInt(mem.addr);
-    for (const w of lab.cur?.writes ?? []) {
+    for (const w of lab.cur?.prev_writes ?? []) {
       const a = BigInt(w.raw_addr);
       for (let i = 0n; i < BigInt(w.size); i++) {
         const off = a + i - start;

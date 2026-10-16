@@ -8,7 +8,11 @@ class Lab {
   cur = $state<State | null>(null);
   error = $state<string | null>(null);
 
-  private ctl: AbortController | null = null;
+  /** Latest requested step. Not reactive: only `pump` and relative moves read it. */
+  private want = 0;
+  private busy = false;
+  private pumping: Promise<void> = Promise.resolve();
+  private navQ: Promise<void> = Promise.resolve();
 
   get last(): number {
     return this.info?.steps ?? 0;
@@ -31,29 +35,56 @@ class Lab {
     }
   }
 
-  /** Fetch the state at `s`; a newer call aborts the previous request. */
-  async goto(s: number) {
-    const n = Math.max(0, Math.min(this.last, Math.round(s)));
-    this.ctl?.abort();
-    const ctl = new AbortController();
-    this.ctl = ctl;
+  /**
+   * Request the state at `s`. Requests collapse into `want`; a single pump fetches until the
+   * displayed step equals `want`, so rapid or held keys are never dropped. The returned promise
+   * settles when the pump goes idle.
+   */
+  goto(s: number): Promise<void> {
+    if (Number.isFinite(s)) this.want = Math.max(0, Math.min(this.last, Math.round(s)));
+    if (!this.busy) {
+      this.busy = true;
+      this.pumping = this.pump();
+    }
+    return this.pumping;
+  }
+
+  /** Move relative to the latest requested step, not the displayed one. */
+  stepBy(d: number) {
+    this.goto(this.want + d);
+  }
+
+  private async pump() {
     try {
-      const st = await api.state(n, ctl.signal);
-      if (this.ctl !== ctl) return;
-      this.cur = st;
-      this.step = n;
-    } catch (e) {
-      this.fail(e);
+      while (this.want !== this.step || this.cur === null) {
+        const n = this.want;
+        try {
+          const st = await api.state(n);
+          this.cur = st;
+          this.step = n;
+        } catch (e) {
+          this.fail(e);
+          this.want = this.step;
+          return;
+        }
+      }
+    } finally {
+      this.busy = false;
     }
   }
 
-  async nav(op: NavOp, extra: { reg?: string; addr?: string } = {}) {
-    try {
-      const r = await api.nav(this.step, op, extra);
-      if (r.step !== null) await this.goto(r.step);
-    } catch (e) {
-      this.fail(e);
-    }
+  /** Navigation ops run one at a time, so each one starts from the previous op's target. */
+  nav(op: NavOp, extra: { reg?: string; addr?: string } = {}): Promise<void> {
+    const run = async () => {
+      try {
+        const r = await api.nav(this.want, op, extra);
+        if (r.step !== null) this.goto(r.step);
+      } catch (e) {
+        this.fail(e);
+      }
+    };
+    this.navQ = this.navQ.then(run);
+    return this.navQ.then(() => this.pumping);
   }
 
   async locate(loc: string) {

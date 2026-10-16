@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use super::{load, with_stdout};
-use crate::model::StackView;
+use crate::model::{RootFrame, StackView};
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
@@ -57,7 +57,7 @@ pub fn render(v: &StackView) -> String {
 pub fn dot_stack(trace: &Path, loc: &str, frames: Option<usize>) -> Result<u8> {
     let lt = load(trace)?;
     let s = lt.locate(loc)?;
-    let v = lt.stack_view(s, frames);
+    let v = lt.stack_view(s, frames, RootFrame::WhenInnermost);
     with_stdout(|out| {
         write!(out, "{}", render(&v))?;
         Ok(0)

@@ -24,7 +24,7 @@ use crate::trace::{self, CHECKPOINT_INTERVAL, Event, EventKind, MemWrite, MapsSn
 pub use abi::Finding;
 pub use activations::Activation;
 pub use nav::NavOp;
-pub use stack::{FrameView, SlotView, StackView};
+pub use stack::{FrameView, RootFrame, SlotView, StackView};
 pub use views::*;
 
 use activations::Activations;
@@ -201,7 +201,8 @@ impl LoadedTrace {
                     }
                 }
             }
-            page += PAGE_SIZE;
+            let Some(next) = page.checked_add(PAGE_SIZE) else { break };
+            page = next;
         }
         let snapshot = self.maps_at(s);
         for k in 0..len {

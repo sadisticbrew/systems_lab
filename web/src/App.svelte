@@ -21,8 +21,8 @@
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     let handled = true;
     switch (e.key) {
-      case "ArrowRight": case "l": lab.goto(lab.step + 1); break;
-      case "ArrowLeft": case "h": lab.goto(lab.step - 1); break;
+      case "ArrowRight": case "l": lab.stepBy(1); break;
+      case "ArrowLeft": case "h": lab.stepBy(-1); break;
       case "n": lab.nav("next-line"); break;
       case "N": lab.nav("prev-line"); break;
       case "s": lab.nav("over"); break;

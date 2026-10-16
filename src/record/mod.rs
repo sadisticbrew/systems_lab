@@ -32,6 +32,8 @@ const TRAP_TRACE: i32 = 2;
 const TRAP_BRKPT: i32 = 1;
 /// `si_code` of an int3 trap.
 const SI_KERNEL: i32 = 0x80;
+/// The trap flag in RFLAGS: the tracer sets it to single-step.
+const TRAP_FLAG: u64 = 1 << 8;
 
 pub struct Options {
     pub from: String,
@@ -81,7 +83,8 @@ pub fn run(opts: &Options) -> Result<u8> {
     Ok(0)
 }
 
-fn unsupported_event(event: i32, step: u32) -> anyhow::Error {
+fn unsupported_event(t: &Tracee, event: i32, step: u32) -> anyhow::Error {
+    t.kill_event_child(event);
     if event == libc::PTRACE_EVENT_EXEC {
         exit::unsupported(format!("unsupported: the program called execve at step {step}"))
     } else {
@@ -91,19 +94,24 @@ fn unsupported_event(event: i32, step: u32) -> anyhow::Error {
     }
 }
 
+/// A job-control stop (SIGSTOP, SIGTSTP, …): only another process could resume the program.
+fn group_stop(sig: i32, when: &str) -> anyhow::Error {
+    exit::unsupported(format!(
+        "unsupported: the program was stopped by {} {when}; only another process can resume a stopped program",
+        signals::name(sig)
+    ))
+}
+
 /// Runs the tracee until it reaches the requested start point; returns the
 /// resolved `from` name.
 fn run_to_start(t: &Tracee, from: &str, info: &elf::ExeInfo, bias: u64) -> Result<String> {
+    let find = |name: &str| info.syms.iter().chain(&info.starts).find(|s| s.name == name);
     let name = match from {
-        "auto" if info.syms.iter().any(|s| s.name == "main") => "main",
+        "auto" if find("main").is_some() => "main",
         "auto" | "entry" => return Ok("entry".to_string()),
         other => other,
     };
-    let sym = info
-        .syms
-        .iter()
-        .find(|s| s.name == name)
-        .ok_or_else(|| exit::usage(format!("unknown symbol '{name}'")))?;
+    let sym = find(name).ok_or_else(|| exit::usage(format!("unknown symbol '{name}'")))?;
     let addr = bias + sym.addr;
     let orig = t.peek(addr)?;
     t.poke(addr, (orig & !0xff) | 0xcc)?;
@@ -114,7 +122,7 @@ fn run_to_start(t: &Tracee, from: &str, info: &elf::ExeInfo, bias: u64) -> Resul
             Stop::Exited(_) | Stop::Signaled(_) => {
                 return Err(exit::usage(format!("program exited before reaching {name}")));
             }
-            Stop::Stopped { event, .. } if event != 0 => return Err(unsupported_event(event, 0)),
+            Stop::Stopped { event, .. } if event != 0 => return Err(unsupported_event(t, event, 0)),
             Stop::Stopped { sig: libc::SIGTRAP, .. } => {
                 // Only our own int3 (SI_KERNEL, rip just past it) is consumed;
                 // any other SIGTRAP belongs to the program.
@@ -126,7 +134,12 @@ fn run_to_start(t: &Tracee, from: &str, info: &elf::ExeInfo, bias: u64) -> Resul
                 }
                 sig = libc::SIGTRAP;
             }
-            Stop::Stopped { sig: s, .. } => sig = s,
+            Stop::Stopped { sig: s, .. } => {
+                if t.in_group_stop() {
+                    return Err(group_stop(s, &format!("before reaching {name}")));
+                }
+                sig = s;
+            }
         }
     }
 }
@@ -202,6 +215,9 @@ impl Recorder {
     }
 
     /// Re-reads the maps; on a change, records a snapshot and the newly readable memory.
+    /// The new snapshots go before the records already pushed for `seq`: a later record
+    /// wins when a state is read, and an instruction that wrote into a freshly grown page
+    /// must keep its attribution.
     fn refresh_maps(&mut self, seq: u32) -> Result<()> {
         let (new, new_ids) = maps::parse_maps_ident(self.t.pid)?;
         if new == self.regions && new_ids == self.ids {
@@ -209,7 +225,10 @@ impl Recorder {
         }
         let fresh = maps::changed_readable(&new, &new_ids, &self.regions, &self.ids);
         self.maps.push(MapsSnapshot { seq, regions: new.clone() });
+        let before = self.writes.len();
         self.snapshot_ranges(seq, &fresh);
+        let (first, added) = (self.writes[..before].partition_point(|w| w.seq < seq), self.writes.len() - before);
+        self.writes[first..].rotate_right(added);
         self.shadow.sync(&self.t, &new);
         self.add_libs(&new);
         self.regions = new;
@@ -312,7 +331,8 @@ pub fn record(opts: &Options) -> Result<Recording> {
         let seq = i + 1;
         let idx = insns.index(&rec.t, cur.rip);
         let plan = &insns.plans[idx as usize];
-        if plan.syscall && matches!(cur.gpr[reg::RAX as usize], 60 | 231) {
+        let rax = cur.gpr[reg::RAX as usize];
+        if plan.syscall && matches!(rax, 60 | 231) || plan.legacy_syscall && matches!(rax as u32, 1 | 252) {
             rec.full_diff(i, WriteKind::Unattributed);
         }
         writes::plan_ranges(plan, &cur, &mut ranges);
@@ -367,8 +387,9 @@ pub fn record(opts: &Options) -> Result<Recording> {
                 break;
             }
             Stop::Stopped { event, .. } if event != 0 => {
+                let err = unsupported_event(&rec.t, event, i);
                 rec.t.kill();
-                return Err(unsupported_event(event, i));
+                return Err(err);
             }
             Stop::Stopped { sig: libc::SIGTRAP, .. } => {
                 let (_, code, addr) = rec.t.siginfo()?;
@@ -390,10 +411,28 @@ pub fn record(opts: &Options) -> Result<Recording> {
                     }
                 }
             }
-            Stop::Stopped { sig, .. } => (StepKind::Fault { signo: sig }, false),
+            Stop::Stopped { sig, .. } => {
+                if rec.t.in_group_stop() {
+                    rec.t.kill();
+                    // The signal that led here was recorded as the previous step's fault.
+                    return Err(group_stop(sig, &format!("at step {}", if delivered != 0 { i - 1 } else { i })));
+                }
+                (StepKind::Fault { signo: sig }, false)
+            }
         };
 
         rec.t.regs(&mut new)?;
+        // Single-stepping sets TF in the real RFLAGS. The program must not see it in %r11, where
+        // `syscall` saves RFLAGS, or in the flags `pushfq` stores: it would behave differently.
+        if completed && cur.rflags & TRAP_FLAG == 0 {
+            if plan.syscall && new.gpr[11] & TRAP_FLAG != 0 {
+                new.gpr[11] &= !TRAP_FLAG;
+                rec.t.set_r11(new.gpr[11])?;
+            }
+            if plan.pushf {
+                rec.t.clear_pushed_tf(new.rsp())?;
+            }
+        }
         push_deltas(&mut reg_deltas, seq, &cur, &new);
         steps.push(Step { insn: idx, kind });
         if seq % CHECKPOINT_INTERVAL == 0 {
@@ -417,9 +456,9 @@ pub fn record(opts: &Options) -> Result<Recording> {
             writes::finish_ranges(plan, &cur, &new, &mut ranges);
             maps_dirty |= rec.record_instr_writes(seq, &ranges);
         }
-        let kernel = run_syscall_event || !matches!(kind, StepKind::Instr) || handler_entry;
+        let kernel = run_syscall_event || plan.legacy_syscall || !matches!(kind, StepKind::Instr) || handler_entry;
         if kernel && !run_syscall_event {
-            // Signal frames may have grown the stack: capture new pages first.
+            // Signal frames and `int $0x80` calls may have grown or mapped memory: capture new pages first.
             rec.refresh_maps(seq)?;
             rec.full_diff(seq, WriteKind::Kernel);
         } else if kernel {

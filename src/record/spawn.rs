@@ -143,6 +143,24 @@ impl Tracee {
         }
     }
 
+    /// Kills and reaps the process the tracee just created, for a `PTRACE_EVENT_FORK`, `VFORK`
+    /// or `CLONE` stop: it is auto-attached, so it would otherwise stay stopped under this
+    /// process for as long as the process runs.
+    pub fn kill_event_child(&self, event: i32) {
+        if !matches!(event, libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE) {
+            return;
+        }
+        let mut child: libc::c_ulong = 0;
+        let msg = &mut child as *mut _ as *mut c_void;
+        if unsafe { libc::ptrace(libc::PTRACE_GETEVENTMSG, self.pid, 0usize, msg) } != 0 {
+            return;
+        }
+        let child = child as libc::pid_t;
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        let mut status = 0;
+        unsafe { libc::waitpid(child, &mut status, libc::__WALL) };
+    }
+
     /// Reads all registers (GPRs, rip, rflags, bases, xmm0-15, mxcsr) into `out`.
     pub fn regs(&self, out: &mut RegFile) -> Result<()> {
         let mut u: libc::user_regs_struct = unsafe { std::mem::zeroed() };
@@ -182,6 +200,28 @@ impl Tracee {
         Ok(())
     }
 
+    /// Sets r11, leaving every other register as it is.
+    pub fn set_r11(&self, value: u64) -> Result<()> {
+        let mut u: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ptrace(libc::PTRACE_GETREGS, self.pid, 0usize, &mut u as *mut _ as *mut c_void) } != 0 {
+            bail!("PTRACE_GETREGS failed: {}", last_os_error());
+        }
+        u.r11 = value;
+        if unsafe { libc::ptrace(libc::PTRACE_SETREGS, self.pid, 0usize, &mut u as *mut _ as *mut c_void) } != 0 {
+            bail!("PTRACE_SETREGS failed: {}", last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Clears the trap flag in the quadword at `addr`, which `pushfq` just stored there.
+    pub fn clear_pushed_tf(&self, addr: u64) -> Result<()> {
+        let word = self.peek(addr)?;
+        if word & super::TRAP_FLAG != 0 {
+            self.poke(addr, word & !super::TRAP_FLAG)?;
+        }
+        Ok(())
+    }
+
     pub fn rip(&self) -> Result<u64> {
         let mut u: libc::user_regs_struct = unsafe { std::mem::zeroed() };
         if unsafe { libc::ptrace(libc::PTRACE_GETREGS, self.pid, 0usize, &mut u as *mut _ as *mut c_void) } != 0 {
@@ -197,6 +237,14 @@ impl Tracee {
             bail!("PTRACE_GETSIGINFO failed: {}", last_os_error());
         }
         Ok((si.si_signo, si.si_code, unsafe { si.si_addr() } as u64))
+    }
+
+    /// Whether the tracee is in a group-stop (a job-control stop such as SIGSTOP) rather than a
+    /// signal-delivery-stop: only there does `PTRACE_GETSIGINFO` fail with `EINVAL`.
+    pub fn in_group_stop(&self) -> bool {
+        let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::ptrace(libc::PTRACE_GETSIGINFO, self.pid, 0usize, &mut si as *mut _ as *mut c_void) };
+        r != 0 && last_os_error().raw_os_error() == Some(libc::EINVAL)
     }
 
     /// Reads as many bytes as are readable from the start of the range; returns the count.

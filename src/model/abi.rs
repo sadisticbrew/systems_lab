@@ -36,7 +36,8 @@ impl LoadedTrace {
             }
             let callee = self.loc(act.entry);
             let at_call = self.regs_at(c);
-            if call_in_scope {
+            // The kernel aligns the stack and clears DF when it enters a signal handler.
+            if call_in_scope && !act.signal {
                 let m = at_call.rsp() % 16;
                 if m != 0 {
                     out.push(finding("call-alignment", c, format!("%rsp mod 16 = {m} before call to {callee} (must be 0)")));
@@ -48,7 +49,8 @@ impl LoadedTrace {
             let (true, Some(r)) = (callee_in_scope, act.ret_step) else { continue };
             let before_ret = self.regs_at(r);
             let after_ret = self.regs_at(r + 1);
-            for id in CALLEE_SAVED {
+            // The signal frame moved %rsp, which is restored by `rt_sigreturn`, not by the handler's `ret`.
+            for id in CALLEE_SAVED.into_iter().filter(|&id| !(act.signal && id == reg::RSP)) {
                 let (v1, v2) = (at_call.get(id) as u64, after_ret.get(id) as u64);
                 if v1 != v2 {
                     out.push(finding(

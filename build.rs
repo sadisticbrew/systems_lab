@@ -41,7 +41,15 @@ fn syscall_table() {
 
 /// Builds `web/dist` with bun, or leaves a placeholder so rust-embed compiles.
 fn viewer_assets() {
-    for p in ["web/src", "web/index.html", "web/package.json", "web/vite.config.ts"] {
+    for p in [
+        "web/src",
+        "web/index.html",
+        "web/package.json",
+        "web/vite.config.ts",
+        "web/bun.lock",
+        "web/svelte.config.js",
+        "web/tsconfig.json",
+    ] {
         println!("cargo:rerun-if-changed={p}");
     }
     println!("cargo:rerun-if-env-changed=SYSTEMSLAB_SKIP_WEB");
@@ -49,9 +57,7 @@ fn viewer_assets() {
     let skip = env::var("SYSTEMSLAB_SKIP_WEB").is_ok_and(|v| v == "1");
     if !skip && web.join("package.json").exists() {
         let bun = find_bun().expect("bun is required to build the SystemsLab viewer");
-        if !web.join("node_modules").exists() {
-            run(&bun, &["install", "--frozen-lockfile"], web);
-        }
+        run(&bun, &["install", "--frozen-lockfile"], web);
         run(&bun, &["run", "build"], web);
         return;
     }

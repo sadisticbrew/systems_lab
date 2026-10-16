@@ -45,6 +45,8 @@ export type State = {
   flags: Record<string, number>;
   xmm: Xmm[];
   writes: Write[];
+  /** Writes of the previous instruction (step - 1): what changed to produce this state. Empty at step 0. */
+  prev_writes: Write[];
   event: TraceEvent | null;
   depth: number;
   stack: StackView;

@@ -61,6 +61,24 @@ fn stack_text_layout() {
 }
 
 #[test]
+fn stack_in_main_shows_mains_own_frame() {
+    let (_b, t) = fact_trace();
+    let v: Value = serde_json::from_str(&ok(&["stack", "--json", p(&t), "main+0x4"])).unwrap();
+    let frames = v["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 1, "{v}");
+    assert_eq!(frames[0]["collapsed"], false);
+    assert_eq!(frames[0]["label"], "main");
+    let slots = frames[0]["slots"].as_array().unwrap();
+    assert_eq!(slots.len(), 2);
+    let l = labels(&frames[0]["slots"]);
+    assert!(l[0].starts_with("return address: "), "{l:?}");
+    assert!(l[1].starts_with("saved %rbp: "), "{l:?}");
+    assert_eq!(slots[1]["pointers"], serde_json::json!(["%rsp", "%rbp"]));
+    let text = ok(&["stack", p(&t), "main+0x4"]);
+    assert_eq!(text.lines().nth(1), Some("main, 16 bytes"), "{text}");
+}
+
+#[test]
 fn stack_frames_option_collapses_outer_activations() {
     let (_b, t) = fact_trace();
     let v: Value = serde_json::from_str(&ok(&["stack", "--json", "--frames", "1", p(&t), "fact+0xc@3"])).unwrap();
@@ -180,4 +198,65 @@ fn info_text_has_the_contract_keys() {
     assert_eq!(keys, ["program", "argv", "from", "steps", "end", "aslr", "unattributed bytes", "syscalls", "signals"]);
     let sys = text.lines().find(|l| l.starts_with("syscalls")).unwrap();
     assert!(sys.contains("write×1") && sys.contains("exit_group×1"), "{sys}");
+}
+
+/// A running `systemslab view`, killed on drop.
+struct Viewer {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_viewer(trace: &std::path::Path) -> Viewer {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_systemslab"))
+        .args(["view", p(trace), "--no-open", "--port", "0"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn view");
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.as_mut().unwrap()).read_line(&mut line).unwrap();
+    let port = line.split("127.0.0.1:").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|p| p.parse().ok()).expect(&line);
+    Viewer { child, port }
+}
+
+/// One `GET` over a fresh connection: status code and body. Fails if the server stays silent for 20 s.
+fn http_get(v: &Viewer, path: &str) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", v.port)).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+    write!(s, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", v.port).unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap_or_else(|e| panic!("GET {path}: {e}"));
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or_else(|| panic!("GET {path}: no response"));
+    (head.split_whitespace().nth(1).unwrap().parse().unwrap(), body.to_string())
+}
+
+#[test]
+fn viewer_answers_hostile_requests_with_the_documented_status() {
+    let (_b, t) = fact_trace();
+    let v = start_viewer(&t);
+    // Out-of-range steps are 404 even when they do not fit in a u32; unparsable ones are 400.
+    assert_eq!(http_get(&v, "/api/state/99999").0, 404);
+    assert_eq!(http_get(&v, "/api/state/5000000000").0, 404);
+    assert_eq!(http_get(&v, "/api/state/abc").0, 400);
+    assert_eq!(http_get(&v, "/api/state/-1").0, 400);
+    assert_eq!(http_get(&v, "/api/mem?addr=0x10&len=4&step=5000000000").0, 404);
+    assert_eq!(http_get(&v, "/api/nav?from=0&op=nope").0, 400);
+    // The top of the address space reads as unmapped instead of wrapping around (which spun forever).
+    let (code, body) = http_get(&v, "/api/mem?addr=0xfffffffffffff000&len=4096&step=0");
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains(r#""bytes":[null,null"#), "{}", &body[..body.len().min(80)]);
+    // Embedded assets cannot be escaped with `..`, plain or percent-encoded.
+    for path in ["/../Cargo.toml", "/%2e%2e/Cargo.toml", "/assets/..%2f..%2fCargo.toml", "/../../../../etc/passwd"] {
+        assert_eq!(http_get(&v, path).0, 404, "{path}");
+    }
+    assert_eq!(http_get(&v, "/api/info").0, 200, "the server is still answering");
 }
