@@ -1,4 +1,5 @@
 :root {
+  color-scheme: light dark;
   --bg: #f6f7f9;
   --panel: #ffffff;
   --fg: #1d2127;
@@ -41,13 +42,16 @@ html, body, #app { height: 100%; margin: 0; }
 body { background: var(--bg); color: var(--fg); font: 13px/1.35 var(--font); }
 .mono { font-family: var(--mono); }
 .dim { color: var(--dim); }
-button, input, select {
+button, input, select, textarea {
   font: inherit; color: inherit; background: var(--panel);
   border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px;
 }
 button { cursor: pointer; }
-button:hover { border-color: var(--accent); }
-input:focus { outline: 1px solid var(--accent); }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .4; cursor: default; }
+input:focus, textarea:focus { outline: 1px solid var(--accent); }
+button:focus-visible, select:focus-visible { outline: 1px solid var(--accent); }
+kbd { font: 12px var(--mono); padding: 0 5px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; background: var(--bg); }
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .panel > h2 { margin: 0; padding: 3px 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); border-bottom: 1px solid var(--border); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .panel > .body { overflow: auto; flex: 1; min-height: 0; }

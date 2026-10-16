@@ -175,16 +175,28 @@ Exit codes:
 
 ## The viewer
 
-`systemslab view` opens a page with the source line, the disassembly, the registers, the
-stack, a memory dump, and a timeline of the whole run. The timeline shows call depth and
-marks calls, returns, syscalls, signals and ABI findings.
+`systemslab view` (and `run`, `try`) opens a page with the source, the disassembly, the
+registers, the stack, a memory dump, and a timeline of the whole run. Step N is the machine
+state just before instruction N runs.
 
-Most of the value is in going backwards:
-
-- click a register to jump to the instruction that last changed it;
-- click a stack slot or a memory byte to jump to the instruction that wrote it;
-- click a disassembly line to jump to the next time that instruction runs;
-- drag the timeline to scrub through the run.
+- **Effects** explains the instruction about to run, from the recording: the registers and
+  memory it reads and writes (`%rax (via %eax): 0xffffffffffffffff → 0x11223344`), the flags
+  it sets, whether a conditional jump's condition holds, what a `call` pushes and whether
+  `%rsp` is 16-byte aligned, and the arguments, buffers and result of a syscall. Press `p` to
+  predict each instruction's effect before it is revealed.
+- **Click to inspect.** Click a register, memory byte or stack slot to see it in every
+  width and signedness, where it last changed and where it changes next. `[` and `]` jump
+  there; Backspace returns to where you were before the jump.
+- **Timeline.** Call depth over the whole run, with marks for calls, returns, syscalls,
+  signals, ABI findings and your bookmarks. Toggle the marks in its legend, hover for
+  labels, scroll to zoom, drag to scrub.
+- **Bottom tabs.** Memory, the syscall and signal events, the program's output up to the
+  current step, ABI findings with explanations, your notes and bookmarks, and the guide.
+- **Your place is kept.** Notes, bookmarks, watches and the last position are saved per
+  trace under `~/.local/share/systemslab/notes/`, panel sizes in
+  `~/.config/systemslab/viewer.json`. The URL carries `#step=N`, so a moment can be bookmarked
+  in the browser. When the trace is re-recorded (`run` after a save, or a new `record -o`
+  over a viewed trace), the viewer reloads and stays at the same instruction.
 
 | Key | Action |
 |---|---|
@@ -192,7 +204,13 @@ Most of the value is in going backwards:
 | `n` / `N` | next or previous source line |
 | `s` / `S` | step over a call, forwards or backwards |
 | `o` / `O` | step out of the function, forwards or backwards |
+| `[` / `]` | previous or next change of the selected register, byte or slot |
+| `Backspace` / `Shift+Backspace` | back or forward in the jump history |
 | `g` | type a locator |
+| `m` | bookmark this step |
+| `p` | predict mode |
+| `Esc` | clear the selection |
+| `?` | help |
 | `Home` / `End` | first or last step |
 
 ## Guides and expressions
